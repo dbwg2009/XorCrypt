@@ -1,4 +1,4 @@
-"""ASCII Cipher Vault — FastAPI backend.
+"""ASCII Cipher Vault — FastAPI backend. edited version
 
 Zero-knowledge architecture: server stores only a per-user salt, an Argon2id hash
 of the client-derived auth_hash, and AES-GCM ciphertext for vault items. The
@@ -38,6 +38,9 @@ CSRF_COOKIE = "csrf"
 CSRF_HEADER = "X-CSRF-Token"
 PBKDF2_ITERATIONS = 200_000
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+# Group invite tokens expire after 7 days
+GROUP_INVITE_TTL = 7 * 24 * 60 * 60
 
 hasher = PasswordHasher(time_cost=3, memory_cost=64 * 1024, parallelism=2)
 
@@ -190,6 +193,34 @@ CREATE TABLE IF NOT EXISTS media (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_media_user ON media(user_id);
+
+-- Tracks which users are authorised to download a given media file.
+-- The uploader is inserted automatically on upload; additional recipients
+-- are added when the uploader sends a message that references the media.
+CREATE TABLE IF NOT EXISTS media_access (
+  media_id TEXT NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+  user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  granted_at INTEGER NOT NULL,
+  PRIMARY KEY (media_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_media_access_user ON media_access(user_id);
+
+-- Pending group invitations.  The inviter pre-wraps the group key for the
+-- invitee and stores it here; the invitee redeems the token to join without
+-- needing the group passphrase.
+CREATE TABLE IF NOT EXISTS group_invites (
+  token       TEXT PRIMARY KEY,
+  group_id    INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+  inviter_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  invitee_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  wrapped_key TEXT NOT NULL,
+  created_at  INTEGER NOT NULL,
+  expires_at  INTEGER NOT NULL,
+  accepted_at INTEGER,
+  UNIQUE (group_id, invitee_id)   -- one pending invite per (group, invitee) pair
+);
+CREATE INDEX IF NOT EXISTS idx_group_invites_invitee ON group_invites(invitee_id, expires_at);
+CREATE INDEX IF NOT EXISTS idx_group_invites_group   ON group_invites(group_id);
 """
 
 
@@ -373,6 +404,9 @@ class MessageIn(BaseModel):
     ciphertext: str = Field(min_length=1, max_length=131072)
     hint: Optional[str] = Field(default=None, max_length=120)
     replyToId: Optional[int] = None
+    # Optional list of media IDs attached to this message; access will be
+    # granted to the recipient for each listed ID.
+    mediaIds: Optional[list[str]] = Field(default=None, max_items=20)
 
 
 class LookupIn(BaseModel):
@@ -395,6 +429,8 @@ class GroupMessageIn(BaseModel):
     ciphertext: str = Field(min_length=1, max_length=131072)
     hint: Optional[str] = Field(default=None, max_length=120)
     replyToId: Optional[int] = None
+    # Optional media IDs; all current group members are granted access.
+    mediaIds: Optional[list[str]] = Field(default=None, max_items=20)
 
 
 class PushSubscriptionIn(BaseModel):
@@ -415,7 +451,15 @@ class ReportIn(BaseModel):
 
 class InviteToGroupIn(BaseModel):
     email: str = Field(min_length=3, max_length=254)
-    groupId: int
+    # The inviter must pre-wrap the group key for the invitee's public key
+    # (or derive it via the group passphrase on the client) before sending.
+    wrappedKeyForInvitee: str = Field(min_length=1, max_length=4096)
+
+
+class AcceptInviteIn(BaseModel):
+    # The invitee may optionally re-wrap the key (e.g. to a different local
+    # key format); if omitted the server uses the key the inviter stored.
+    wrappedKey: Optional[str] = Field(default=None, min_length=1, max_length=4096)
 
 
 app = FastAPI(title="ASCII Cipher Vault", openapi_url=None, docs_url=None, redoc_url=None)
@@ -795,6 +839,30 @@ def _fire_push(recipient_ids: list, title: str, body_text: str):
     threading.Thread(target=_send, daemon=True).start()
 
 
+def _grant_media_access(conn, media_ids: list[str], uploader_id: int, recipient_ids: list[int]):
+    """Grant recipient_ids access to each media_id, verifying the uploader owns each file."""
+    if not media_ids or not recipient_ids:
+        return
+    now = int(time.time())
+    for mid in media_ids:
+        if not re.match(r"^[A-Za-z0-9_\-]{1,64}$", mid):
+            continue
+        row = conn.execute(
+            "SELECT user_id FROM media WHERE id = ?", (mid,)
+        ).fetchone()
+        # Only the uploader may grant access to their files.
+        if not row or row["user_id"] != uploader_id:
+            continue
+        for uid in recipient_ids:
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO media_access (media_id, user_id, granted_at) VALUES (?,?,?)",
+                    (mid, uid, now)
+                )
+            except Exception:
+                pass
+
+
 @app.post("/api/messages", status_code=201)
 def message_send(body: MessageIn, user = Depends(auth_dep)):
     if body.recipientId == user["id"]:
@@ -808,6 +876,9 @@ def message_send(body: MessageIn, user = Depends(auth_dep)):
             "INSERT INTO messages (sender_id, recipient_id, ciphertext, hint, reply_to_id, created_at) VALUES (?,?,?,?,?,?)",
             (user["id"], body.recipientId, body.ciphertext, body.hint, body.replyToId, now)
         )
+        # Grant recipient access to any attached media files.
+        if body.mediaIds:
+            _grant_media_access(conn, body.mediaIds, user["id"], [body.recipientId])
     _fire_push([body.recipientId], f"New message from {user['email']}", body.hint or "encrypted message")
     return {"id": cur.lastrowid, "createdAt": now}
 
@@ -1026,13 +1097,15 @@ def group_message_send(group_id: int, body: GroupMessageIn, user = Depends(auth_
             "INSERT INTO group_messages (group_id, sender_id, ciphertext, hint, reply_to_id, created_at) VALUES (?,?,?,?,?,?)",
             (group_id, user["id"], body.ciphertext, body.hint, body.replyToId, now)
         )
-        # Get all group members to notify
         members = conn.execute(
             "SELECT user_id FROM group_members WHERE group_id = ? AND user_id != ?",
             (group_id, user["id"])
         ).fetchall()
+        member_ids = [m["user_id"] for m in members]
+        # Grant all current group members access to any attached media.
+        if body.mediaIds:
+            _grant_media_access(conn, body.mediaIds, user["id"], member_ids + [user["id"]])
 
-    member_ids = [m["user_id"] for m in members]
     _fire_push(member_ids, "New group message", body.hint or "encrypted message")
     return {"id": cur.lastrowid, "createdAt": now}
 
@@ -1064,7 +1137,184 @@ def group_message_delete(group_id: int, msg_id: int, user = Depends(auth_dep)):
     return Response(status_code=204)
 
 
-# ── Blocking ──
+# ── Group invites ──────────────────────────────────────────────────────────────
+
+@app.post("/api/groups/{group_id}/invite", status_code=201)
+def invite_to_group(group_id: int, body: InviteToGroupIn, request: Request, user = Depends(auth_dep)):
+    """
+    Create a time-limited invite for another registered user.
+
+    The inviter must already be a group member and must supply
+    `wrappedKeyForInvitee`: the group key wrapped for the invitee (e.g.
+    encrypted to their public key or re-derived from the group passphrase
+    on the client).  The invitee redeems the invite via POST /api/invites/{token}/accept
+    — they never need to know the group passphrase.
+    """
+    rate_limit(f"invite:{client_ip(request)}", 20, 60)
+    email = body.email.lower().strip()
+    if not EMAIL_RE.match(email):
+        raise HTTPException(400, "Invalid email")
+    now = int(time.time())
+    with db() as conn:
+        # Caller must be a member.
+        _require_group_member(conn, group_id, user["id"])
+
+        target = conn.execute(
+            "SELECT id, email FROM users WHERE email = ?", (email,)
+        ).fetchone()
+        if not target:
+            raise HTTPException(404, "No account with that email")
+        if target["id"] == user["id"]:
+            raise HTTPException(400, "Cannot invite yourself")
+
+        # Check the invitee is not already a member.
+        already = conn.execute(
+            "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?",
+            (group_id, target["id"])
+        ).fetchone()
+        if already:
+            raise HTTPException(409, "User is already a member of this group")
+
+        token = secrets.token_urlsafe(32)
+        expires_at = now + GROUP_INVITE_TTL
+        try:
+            conn.execute(
+                """INSERT INTO group_invites
+                     (token, group_id, inviter_id, invitee_id, wrapped_key, created_at, expires_at)
+                   VALUES (?,?,?,?,?,?,?)
+                   ON CONFLICT(group_id, invitee_id) DO UPDATE SET
+                     token       = excluded.token,
+                     inviter_id  = excluded.inviter_id,
+                     wrapped_key = excluded.wrapped_key,
+                     created_at  = excluded.created_at,
+                     expires_at  = excluded.expires_at,
+                     accepted_at = NULL
+                """,
+                (token, group_id, user["id"], target["id"],
+                 body.wrappedKeyForInvitee, now, expires_at)
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(500, "Could not create invite")
+
+    # In a real deployment you would email the token to target["email"] here.
+    return {
+        "token": token,
+        "inviteeEmail": target["email"],
+        "expiresAt": expires_at,
+    }
+
+
+@app.get("/api/invites/{token}")
+def invite_info(token: str, user = Depends(require_user)):
+    """
+    Return public metadata about a pending invite so the client can show a
+    confirmation screen before the invitee accepts.
+    """
+    now = int(time.time())
+    with db() as conn:
+        row = conn.execute(
+            """SELECT gi.group_id, gi.invitee_id, gi.inviter_id, gi.expires_at,
+                      gi.accepted_at, g.name AS group_name, u.email AS inviter_email
+                 FROM group_invites gi
+                 JOIN groups g ON g.id = gi.group_id
+                 JOIN users  u ON u.id = gi.inviter_id
+                WHERE gi.token = ?""",
+            (token,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Invite not found")
+    if row["expires_at"] < now:
+        raise HTTPException(410, "Invite has expired")
+    if row["accepted_at"] is not None:
+        raise HTTPException(410, "Invite has already been accepted")
+    # Only the intended invitee (or the inviter) may inspect the invite.
+    if user["id"] not in (row["invitee_id"], row["inviter_id"]):
+        raise HTTPException(403, "Not your invite")
+    return {
+        "groupId": row["group_id"],
+        "groupName": row["group_name"],
+        "inviterEmail": row["inviter_email"],
+        "expiresAt": row["expires_at"],
+    }
+
+
+@app.post("/api/invites/{token}/accept", status_code=201)
+def accept_invite(token: str, body: AcceptInviteIn, user = Depends(auth_dep)):
+    """
+    Redeem a pending group invite.  The invitee is added to group_members
+    using the wrapped key stored by the inviter (or a replacement supplied
+    by the invitee in the request body).
+    """
+    now = int(time.time())
+    with db() as conn:
+        row = conn.execute(
+            "SELECT group_id, invitee_id, wrapped_key, expires_at, accepted_at FROM group_invites WHERE token = ?",
+            (token,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Invite not found")
+        if row["expires_at"] < now:
+            raise HTTPException(410, "Invite has expired")
+        if row["accepted_at"] is not None:
+            raise HTTPException(410, "Invite has already been accepted")
+        if row["invitee_id"] != user["id"]:
+            raise HTTPException(403, "This invite is not for you")
+
+        group_id = row["group_id"]
+        wrapped_key = body.wrappedKey if body.wrappedKey else row["wrapped_key"]
+
+        # Add to group (or refresh key if they somehow re-joined).
+        existing = conn.execute(
+            "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?",
+            (group_id, user["id"])
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE group_members SET wrapped_key = ? WHERE group_id = ? AND user_id = ?",
+                (wrapped_key, group_id, user["id"])
+            )
+        else:
+            conn.execute(
+                "INSERT INTO group_members (group_id, user_id, wrapped_key, joined_at, last_read_at) VALUES (?,?,?,?,?)",
+                (group_id, user["id"], wrapped_key, now, now)
+            )
+        conn.execute(
+            "UPDATE group_invites SET accepted_at = ? WHERE token = ?", (now, token)
+        )
+
+        group = conn.execute("SELECT name FROM groups WHERE id = ?", (group_id,)).fetchone()
+
+    return {"groupId": group_id, "groupName": group["name"] if group else None}
+
+
+@app.get("/api/invites")
+def list_pending_invites(user = Depends(require_user)):
+    """Return all pending (unaccepted, unexpired) invites addressed to the current user."""
+    now = int(time.time())
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT gi.token, gi.group_id, g.name AS group_name,
+                      u.email AS inviter_email, gi.expires_at
+                 FROM group_invites gi
+                 JOIN groups g ON g.id = gi.group_id
+                 JOIN users  u ON u.id = gi.inviter_id
+                WHERE gi.invitee_id = ?
+                  AND gi.accepted_at IS NULL
+                  AND gi.expires_at > ?
+                ORDER BY gi.created_at DESC""",
+            (user["id"], now)
+        ).fetchall()
+    return [{
+        "token": r["token"],
+        "groupId": r["group_id"],
+        "groupName": r["group_name"],
+        "inviterEmail": r["inviter_email"],
+        "expiresAt": r["expires_at"],
+    } for r in rows]
+
+
+# ── Blocking ──────────────────────────────────────────────────────────────────
+
 @app.post("/api/block", status_code=201)
 def block_user(body: BlockIn, user = Depends(auth_dep)):
     if body.userId == user["id"]:
@@ -1106,7 +1356,8 @@ def list_blocked(user = Depends(auth_dep)):
     return [{"id": r["id"], "email": r["email"], "blockedAt": r["created_at"]} for r in rows]
 
 
-# ── Reports ──
+# ── Reports ───────────────────────────────────────────────────────────────────
+
 @app.post("/api/report", status_code=201)
 def report(body: ReportIn, user = Depends(auth_dep)):
     if not body.reportedUserId and not body.messageId and not body.groupMessageId:
@@ -1121,22 +1372,8 @@ def report(body: ReportIn, user = Depends(auth_dep)):
     return {"id": cur.lastrowid}
 
 
-# ── Invite to group by email ──
-@app.post("/api/groups/{group_id}/invite", status_code=201)
-def invite_to_group(group_id: int, body: InviteToGroupIn, user = Depends(auth_dep)):
-    with db() as conn:
-        _require_group_member(conn, group_id, user["id"])
-        target = conn.execute(
-            "SELECT id FROM users WHERE email = ?", (body.email.lower(),)
-        ).fetchone()
-        if not target:
-            raise HTTPException(404, "User not found")
-        # Send invitation (in real app, would email the join code)
-        # For now, just return the info for client to handle
-    return {"message": f"Invitation info ready for {body.email}"}
+# ── Session management ────────────────────────────────────────────────────────
 
-
-# ── Session management ──
 @app.post("/api/auth/logout-all")
 def logout_all(body: DeleteAccountIn, user = Depends(auth_dep)):
     """Logout all other sessions, require password (auth_hash) verification"""
@@ -1152,7 +1389,8 @@ def logout_all(body: DeleteAccountIn, user = Depends(auth_dep)):
     return {"ok": True}
 
 
-# ── Login tracking ──
+# ── Login tracking ────────────────────────────────────────────────────────────
+
 def _log_login(user_id: int, request: Request):
     """Track login history for sign-in notifications"""
     try:
@@ -1184,7 +1422,8 @@ def get_logins(user = Depends(require_user)):
     } for r in rows]
 
 
-# ── Media uploads (zero-knowledge: ciphertext only) ──
+# ── Media uploads (zero-knowledge: ciphertext only) ───────────────────────────
+
 @app.post("/api/media", status_code=201)
 async def media_upload(request: Request, user = Depends(auth_dep)):
     """Accept encrypted media blob and store it. Returns media_id for the recipient."""
@@ -1198,20 +1437,39 @@ async def media_upload(request: Request, user = Depends(auth_dep)):
     media_dir.mkdir(parents=True, exist_ok=True)
     media_id = secrets.token_urlsafe(24)
     now = int(time.time())
-    (media_dir / media_id).write_bytes(body)
     with db() as conn:
         conn.execute(
             "INSERT INTO media (id, user_id, size_bytes, created_at) VALUES (?,?,?,?)",
             (media_id, user["id"], len(body), now)
         )
+        # The uploader always has access to their own file.
+        conn.execute(
+            "INSERT OR IGNORE INTO media_access (media_id, user_id, granted_at) VALUES (?,?,?)",
+            (media_id, user["id"], now)
+        )
+    (media_dir / media_id).write_bytes(body)
     return {"mediaId": media_id, "size": len(body)}
 
 
 @app.get("/api/media/{media_id}")
 def media_get(media_id: str, user = Depends(require_user)):
-    """Return the raw encrypted blob. Authenticated users only; ID is unguessable."""
+    """
+    Return the raw encrypted blob.
+
+    Access is restricted to:
+      - the original uploader, and
+      - any user explicitly granted access (i.e. a message recipient or group
+        member whose message included this media_id).
+    """
     if not re.match(r"^[A-Za-z0-9_\-]{1,64}$", media_id):
         raise HTTPException(400, "Invalid media id")
+    with db() as conn:
+        access = conn.execute(
+            "SELECT 1 FROM media_access WHERE media_id = ? AND user_id = ?",
+            (media_id, user["id"])
+        ).fetchone()
+    if not access:
+        raise HTTPException(403, "Access denied")
     media_dir = DB_PATH.parent / "media"
     path = media_dir / media_id
     if not path.is_file():
