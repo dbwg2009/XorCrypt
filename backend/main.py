@@ -1,4 +1,4 @@
-"""ASCII Cipher Vault — FastAPI backend. edited version
+ """ASCII Cipher Vault — FastAPI backend.
 
 Zero-knowledge architecture: server stores only a per-user salt, an Argon2id hash
 of the client-derived auth_hash, and AES-GCM ciphertext for vault items. The
@@ -10,6 +10,7 @@ import time
 import secrets
 import hmac
 import hashlib
+import logging
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -41,6 +42,8 @@ EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 # Group invite tokens expire after 7 days
 GROUP_INVITE_TTL = 7 * 24 * 60 * 60
+
+logger = logging.getLogger(__name__)
 
 hasher = PasswordHasher(time_cost=3, memory_cost=64 * 1024, parallelism=2)
 
@@ -399,38 +402,19 @@ class DeleteAccountIn(BaseModel):
     authHash: str = Field(pattern="^[0-9a-fA-F]{64}$")
 
 
-class MessageIn(BaseModel):
+class BaseMessageIn(BaseModel):
+    ciphertext: str = Field(min_length=1, max_length=131072)
+    hint: Optional[str] = Field(default=None, max_length=120)
+    replyToId: Optional[int] = None
+    mediaIds: Optional[list[str]] = Field(default=None, max_items=20)
+
+
+class MessageIn(BaseMessageIn):
     recipientId: int
-    ciphertext: str = Field(min_length=1, max_length=131072)
-    hint: Optional[str] = Field(default=None, max_length=120)
-    replyToId: Optional[int] = None
-    # Optional list of media IDs attached to this message; access will be
-    # granted to the recipient for each listed ID.
-    mediaIds: Optional[list[str]] = Field(default=None, max_items=20)
 
 
-class LookupIn(BaseModel):
-    email: str = Field(min_length=3, max_length=254)
-
-
-class GroupCreateIn(BaseModel):
-    name: str = Field(min_length=1, max_length=80)
-    salt: str = Field(pattern="^[0-9a-fA-F]{32}$")
-    authHash: str = Field(pattern="^[0-9a-fA-F]{64}$")
-    wrappedKey: str = Field(min_length=1, max_length=4096)
-
-
-class GroupJoinIn(BaseModel):
-    authHash: str = Field(pattern="^[0-9a-fA-F]{64}$")
-    wrappedKey: str = Field(min_length=1, max_length=4096)
-
-
-class GroupMessageIn(BaseModel):
-    ciphertext: str = Field(min_length=1, max_length=131072)
-    hint: Optional[str] = Field(default=None, max_length=120)
-    replyToId: Optional[int] = None
-    # Optional media IDs; all current group members are granted access.
-    mediaIds: Optional[list[str]] = Field(default=None, max_items=20)
+class GroupMessageIn(BaseMessageIn):
+    pass
 
 
 class PushSubscriptionIn(BaseModel):
@@ -840,27 +824,51 @@ def _fire_push(recipient_ids: list, title: str, body_text: str):
 
 
 def _grant_media_access(conn, media_ids: list[str], uploader_id: int, recipient_ids: list[int]):
-    """Grant recipient_ids access to each media_id, verifying the uploader owns each file."""
+    """Grant recipients access to uploaded media owned by uploader_id."""
+
     if not media_ids or not recipient_ids:
         return
+
     now = int(time.time())
-    for mid in media_ids:
+
+    deduped_media_ids = list(dict.fromkeys(media_ids))
+    deduped_recipient_ids = list(dict.fromkeys(recipient_ids))
+
+    for mid in deduped_media_ids:
         if not re.match(r"^[A-Za-z0-9_\-]{1,64}$", mid):
+            logger.warning("Rejected invalid media_id during grant: %s", mid)
             continue
+
         row = conn.execute(
-            "SELECT user_id FROM media WHERE id = ?", (mid,)
+            "SELECT user_id FROM media WHERE id = ?",
+            (mid,),
         ).fetchone()
-        # Only the uploader may grant access to their files.
+
         if not row or row["user_id"] != uploader_id:
+            logger.warning(
+                "Unauthorized media access grant attempt (media_id=%s uploader_id=%s)",
+                mid,
+                uploader_id,
+            )
             continue
-        for uid in recipient_ids:
-            try:
-                conn.execute(
-                    "INSERT OR IGNORE INTO media_access (media_id, user_id, granted_at) VALUES (?,?,?)",
-                    (mid, uid, now)
-                )
-            except Exception:
-                pass
+
+        values = [(mid, uid, now) for uid in deduped_recipient_ids]
+
+        try:
+            conn.executemany(
+                "INSERT OR IGNORE INTO media_access "
+                "(media_id, user_id, granted_at) VALUES (?,?,?)",
+                values,
+            )
+        except sqlite3.DatabaseError:
+            logger.exception(
+                "Failed granting media access during INSERT OR IGNORE into media_access "
+                "(media_id=%s recipient_count=%s granted_at=%s)",
+                mid,
+                len(deduped_recipient_ids),
+                now,
+            )
+            raise
 
 
 @app.post("/api/messages", status_code=201)
@@ -1104,7 +1112,7 @@ def group_message_send(group_id: int, body: GroupMessageIn, user = Depends(auth_
         member_ids = [m["user_id"] for m in members]
         # Grant all current group members access to any attached media.
         if body.mediaIds:
-            _grant_media_access(conn, body.mediaIds, user["id"], member_ids + [user["id"]])
+            _grant_media_access(conn, body.mediaIds, user["id"], member_ids)
 
     _fire_push(member_ids, "New group message", body.hint or "encrypted message")
     return {"id": cur.lastrowid, "createdAt": now}
@@ -1138,6 +1146,38 @@ def group_message_delete(group_id: int, msg_id: int, user = Depends(auth_dep)):
 
 
 # ── Group invites ──────────────────────────────────────────────────────────────
+
+def _get_valid_invite(conn, token: str, now: int):
+    row = conn.execute(
+        """
+        SELECT gi.group_id,
+               gi.invitee_id,
+               gi.inviter_id,
+               gi.wrapped_key,
+               gi.expires_at,
+               gi.accepted_at,
+               g.name AS group_name,
+               u.email AS inviter_email
+          FROM group_invites gi
+          JOIN groups g ON g.id = gi.group_id
+          JOIN users u ON u.id = gi.inviter_id
+         WHERE gi.token = ?
+        """,
+        (token,),
+    ).fetchone()
+
+    if not row:
+        raise HTTPException(404, "Invite not found")
+
+    if row["expires_at"] < now:
+        raise HTTPException(410, "Invite has expired")
+
+    if row["accepted_at"] is not None:
+        raise HTTPException(410, "Invite has already been accepted")
+
+    return row
+
+
 
 @app.post("/api/groups/{group_id}/invite", status_code=201)
 def invite_to_group(group_id: int, body: InviteToGroupIn, request: Request, user = Depends(auth_dep)):
@@ -1193,8 +1233,8 @@ def invite_to_group(group_id: int, body: InviteToGroupIn, request: Request, user
                 (token, group_id, user["id"], target["id"],
                  body.wrappedKeyForInvitee, now, expires_at)
             )
-        except sqlite3.IntegrityError:
-            raise HTTPException(500, "Could not create invite")
+        except sqlite3.IntegrityError as err:
+            raise HTTPException(500, "Could not create invite") from err
 
     # In a real deployment you would email the token to target["email"] here.
     return {
@@ -1211,25 +1251,13 @@ def invite_info(token: str, user = Depends(require_user)):
     confirmation screen before the invitee accepts.
     """
     now = int(time.time())
+
     with db() as conn:
-        row = conn.execute(
-            """SELECT gi.group_id, gi.invitee_id, gi.inviter_id, gi.expires_at,
-                      gi.accepted_at, g.name AS group_name, u.email AS inviter_email
-                 FROM group_invites gi
-                 JOIN groups g ON g.id = gi.group_id
-                 JOIN users  u ON u.id = gi.inviter_id
-                WHERE gi.token = ?""",
-            (token,)
-        ).fetchone()
-    if not row:
-        raise HTTPException(404, "Invite not found")
-    if row["expires_at"] < now:
-        raise HTTPException(410, "Invite has expired")
-    if row["accepted_at"] is not None:
-        raise HTTPException(410, "Invite has already been accepted")
-    # Only the intended invitee (or the inviter) may inspect the invite.
+        row = _get_valid_invite(conn, token, now)
+
     if user["id"] not in (row["invitee_id"], row["inviter_id"]):
         raise HTTPException(403, "Not your invite")
+
     return {
         "groupId": row["group_id"],
         "groupName": row["group_name"],
@@ -1241,50 +1269,67 @@ def invite_info(token: str, user = Depends(require_user)):
 @app.post("/api/invites/{token}/accept", status_code=201)
 def accept_invite(token: str, body: AcceptInviteIn, user = Depends(auth_dep)):
     """
-    Redeem a pending group invite.  The invitee is added to group_members
-    using the wrapped key stored by the inviter (or a replacement supplied
-    by the invitee in the request body).
+    Redeem a pending group invite.
     """
     now = int(time.time())
+
     with db() as conn:
-        row = conn.execute(
-            "SELECT group_id, invitee_id, wrapped_key, expires_at, accepted_at FROM group_invites WHERE token = ?",
-            (token,)
-        ).fetchone()
-        if not row:
-            raise HTTPException(404, "Invite not found")
-        if row["expires_at"] < now:
-            raise HTTPException(410, "Invite has expired")
-        if row["accepted_at"] is not None:
-            raise HTTPException(410, "Invite has already been accepted")
+        row = _get_valid_invite(conn, token, now)
+
         if row["invitee_id"] != user["id"]:
             raise HTTPException(403, "This invite is not for you")
 
         group_id = row["group_id"]
-        wrapped_key = body.wrappedKey if body.wrappedKey else row["wrapped_key"]
+        wrapped_key = body.wrappedKey or row["wrapped_key"]
 
-        # Add to group (or refresh key if they somehow re-joined).
-        existing = conn.execute(
-            "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?",
-            (group_id, user["id"])
+        conn.execute("BEGIN")
+
+        try:
+            existing = conn.execute(
+                "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?",
+                (group_id, user["id"]),
+            ).fetchone()
+
+            if existing:
+                conn.execute(
+                    "UPDATE group_members "
+                    "SET wrapped_key = ? "
+                    "WHERE group_id = ? AND user_id = ?",
+                    (wrapped_key, group_id, user["id"]),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO group_members "
+                    "(group_id, user_id, wrapped_key, joined_at, last_read_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (group_id, user["id"], wrapped_key, now, now),
+                )
+
+            conn.execute(
+                "UPDATE group_invites SET accepted_at = ? WHERE token = ?",
+                (now, token),
+            )
+
+            conn.execute("COMMIT")
+
+        except Exception:
+            conn.execute("ROLLBACK")
+            logger.exception(
+                "Failed accepting invite token=%s user_id=%s",
+                token,
+                user["id"],
+            )
+            raise
+
+        group = conn.execute(
+            "SELECT name FROM groups WHERE id = ?",
+            (group_id,),
         ).fetchone()
-        if existing:
-            conn.execute(
-                "UPDATE group_members SET wrapped_key = ? WHERE group_id = ? AND user_id = ?",
-                (wrapped_key, group_id, user["id"])
-            )
-        else:
-            conn.execute(
-                "INSERT INTO group_members (group_id, user_id, wrapped_key, joined_at, last_read_at) VALUES (?,?,?,?,?)",
-                (group_id, user["id"], wrapped_key, now, now)
-            )
-        conn.execute(
-            "UPDATE group_invites SET accepted_at = ? WHERE token = ?", (now, token)
-        )
 
-        group = conn.execute("SELECT name FROM groups WHERE id = ?", (group_id,)).fetchone()
-
-    return {"groupId": group_id, "groupName": group["name"] if group else None}
+    return {
+        "groupId": group_id,
+        "groupName": group["name"] if group else None,
+    }
 
 
 @app.get("/api/invites")
