@@ -1,4 +1,4 @@
- """ASCII Cipher Vault — FastAPI backend.
+"""ASCII Cipher Vault — FastAPI backend.
 
 Zero-knowledge architecture: server stores only a per-user salt, an Argon2id hash
 of the client-derived auth_hash, and AES-GCM ciphertext for vault items. The
@@ -1315,10 +1315,10 @@ def accept_invite(token: str, body: AcceptInviteIn, user = Depends(auth_dep)):
         except Exception:
             conn.execute("ROLLBACK")
             logger.exception(
-                "Failed accepting invite token=%s user_id=%s",
-                token,
-                user["id"],
-            )
+              "Failed accepting group invite for user_id=%s group_id=%s",
+               user["id"],
+               group_id,
+           )
             raise
 
         group = conn.execute(
