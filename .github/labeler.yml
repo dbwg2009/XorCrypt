@@ -1,0 +1,41 @@
+# Area labels — applied based on which files changed in the PR.
+# Type labels (bug, enhancement, etc.) are applied separately from the PR title prefix.
+
+"area: frontend":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/cli/**"
+
+"area: api":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/**"
+          - "include/**"
+
+"area: auth":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/crypto/**"
+          - "include/crypto/**"
+
+"area: database":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/utils/**"
+          - "include/utils/**"
+
+"area: docs":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/**"
+          - "*.md"
+
+"area: infra":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - "CMakeLists.txt"
+          - "cmake/**"
+          - "scripts/**"
+          - ".env.example"
+          - "*.config.*"
