@@ -1,1543 +1,1334 @@
-"""ASCII Cipher Vault — FastAPI backend.
-
-Zero-knowledge architecture: server stores only a per-user salt, an Argon2id hash
-of the client-derived auth_hash, and AES-GCM ciphertext for vault items. The
-master password and the vault key never leave the browser.
-"""
-import os
-import re
-import time
-import secrets
-import hmac
-import hashlib
-import logging
-import sqlite3
-from contextlib import contextmanager
-from pathlib import Path
-from typing import Optional
-
-from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError, InvalidHash
-from fastapi import FastAPI, Request, Response, HTTPException, Depends
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
-
-ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = Path(os.environ.get("CIPHER_DB", str(ROOT / "data" / "cipher.db")))
-STATIC_DIR = Path(os.environ.get("CIPHER_STATIC", str(ROOT / "static")))
-SECRET_KEY = os.environ.get("CIPHER_SECRET")
-if not SECRET_KEY or SECRET_KEY == "changeme":
-    raise RuntimeError("CIPHER_SECRET env var required (run: openssl rand -hex 32)")
-
-REGISTRATION_TOKEN = os.environ.get("CIPHER_REGISTRATION_TOKEN", "")
-TRUST_PROXY = os.environ.get("CIPHER_TRUST_PROXY", "1") == "1"
-
-SESSION_TTL = 30 * 24 * 60 * 60
-SESSION_COOKIE = "sid"
-CSRF_COOKIE = "csrf"
-CSRF_HEADER = "X-CSRF-Token"
-PBKDF2_ITERATIONS = 200_000
-EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
-
-# Group invite tokens expire after 7 days
-GROUP_INVITE_TTL = 7 * 24 * 60 * 60
-
-logger = logging.getLogger(__name__)
-
-hasher = PasswordHasher(time_cost=3, memory_cost=64 * 1024, parallelism=2)
-
-SCHEMA = """
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
-
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  email TEXT UNIQUE NOT NULL,
-  auth_salt BLOB NOT NULL,
-  auth_hash TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  last_login_at INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS sessions (
-  id TEXT PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  csrf TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  expires_at INTEGER NOT NULL,
-  user_agent TEXT,
-  ip TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
-
-CREATE TABLE IF NOT EXISTS vault_items (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  label_ct TEXT NOT NULL,
-  payload_ct TEXT NOT NULL,
-  pinned INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_vault_user ON vault_items(user_id);
-
-CREATE TABLE IF NOT EXISTS history (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  op TEXT NOT NULL,
-  preview_ct TEXT NOT NULL,
-  created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_history_user_time ON history(user_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  recipient_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  ciphertext TEXT NOT NULL,
-  hint TEXT,
-  reply_to_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
-  created_at INTEGER NOT NULL,
-  read_at INTEGER,
-  deleted_by_sender INTEGER NOT NULL DEFAULT 0,
-  deleted_by_recipient INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_sender    ON messages(sender_id,    created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_pair      ON messages(sender_id, recipient_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS groups (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  salt BLOB NOT NULL,
-  verifier_hash TEXT NOT NULL,
-  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-  created_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS group_members (
-  group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  wrapped_key TEXT NOT NULL,
-  joined_at INTEGER NOT NULL,
-  last_read_at INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (group_id, user_id)
-);
-CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);
-
-CREATE TABLE IF NOT EXISTS group_messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-  sender_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-  ciphertext TEXT NOT NULL,
-  hint TEXT,
-  reply_to_id INTEGER REFERENCES group_messages(id) ON DELETE SET NULL,
-  created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_group_messages_group ON group_messages(group_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS push_subscriptions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  subscription_json TEXT NOT NULL,
-  user_agent TEXT,
-  created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(user_id);
-
-CREATE TABLE IF NOT EXISTS blocked_users (
-  blocker_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  blocked_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  created_at INTEGER NOT NULL,
-  PRIMARY KEY (blocker_id, blocked_id)
-);
-CREATE INDEX IF NOT EXISTS idx_blocked_users_blocked ON blocked_users(blocked_id);
-
-CREATE TABLE IF NOT EXISTS reports (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  reporter_id INTEGER NOT NULL REFERENCES users(id) ON DELETE SET NULL,
-  reported_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-  message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
-  group_message_id INTEGER REFERENCES group_messages(id) ON DELETE SET NULL,
-  reason TEXT NOT NULL,
-  details TEXT,
-  created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_reports_reported_user ON reports(reported_user_id);
-
-CREATE TABLE IF NOT EXISTS archived_messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  original_msg_id INTEGER NOT NULL,
-  sender_id INTEGER,
-  recipient_id INTEGER,
-  ciphertext TEXT NOT NULL,
-  hint TEXT,
-  created_at INTEGER NOT NULL,
-  archived_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_archived_messages_sender ON archived_messages(sender_id);
-CREATE INDEX IF NOT EXISTS idx_archived_messages_recipient ON archived_messages(recipient_id);
-
-CREATE TABLE IF NOT EXISTS login_history (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  ip TEXT,
-  user_agent TEXT,
-  created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_login_history_user ON login_history(user_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS media (
-  id TEXT PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  size_bytes INTEGER NOT NULL,
-  created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_media_user ON media(user_id);
-
--- Tracks which users are authorised to download a given media file.
--- The uploader is inserted automatically on upload; additional recipients
--- are added when the uploader sends a message that references the media.
-CREATE TABLE IF NOT EXISTS media_access (
-  media_id TEXT NOT NULL REFERENCES media(id) ON DELETE CASCADE,
-  user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  granted_at INTEGER NOT NULL,
-  PRIMARY KEY (media_id, user_id)
-);
-CREATE INDEX IF NOT EXISTS idx_media_access_user ON media_access(user_id);
-
--- Pending group invitations.  The inviter pre-wraps the group key for the
--- invitee and stores it here; the invitee redeems the token to join without
--- needing the group passphrase.
-CREATE TABLE IF NOT EXISTS group_invites (
-  token       TEXT PRIMARY KEY,
-  group_id    INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-  inviter_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  invitee_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  wrapped_key TEXT NOT NULL,
-  created_at  INTEGER NOT NULL,
-  expires_at  INTEGER NOT NULL,
-  accepted_at INTEGER,
-  UNIQUE (group_id, invitee_id)   -- one pending invite per (group, invitee) pair
-);
-CREATE INDEX IF NOT EXISTS idx_group_invites_invitee ON group_invites(invitee_id, expires_at);
-CREATE INDEX IF NOT EXISTS idx_group_invites_group   ON group_invites(group_id);
-"""
-
-
-def _migrate(conn):
-    """Apply additive column migrations safely."""
-    migrations = [
-        ("messages",       "reply_to_id", "INTEGER REFERENCES messages(id) ON DELETE SET NULL"),
-        ("group_messages", "reply_to_id", "INTEGER REFERENCES group_messages(id) ON DELETE SET NULL"),
-        ("push_subscriptions", None, None),  # table-level check only
-    ]
-    existing_tables = {r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    ).fetchall()}
-    for table, col, coldef in migrations:
-        if col is None:
-            continue
-        if table not in existing_tables:
-            continue
-        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-        if col not in cols:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coldef}")
-
-
-def init_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.executescript(SCHEMA)
-        _migrate(conn)
-
-
-@contextmanager
-def db():
-    conn = sqlite3.connect(DB_PATH, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-
-_rl_store: dict[str, list[float]] = {}
-
-def rate_limit(key: str, limit: int, window: float):
-    now = time.time()
-    bucket = _rl_store.setdefault(key, [])
-    cutoff = now - window
-    while bucket and bucket[0] < cutoff:
-        bucket.pop(0)
-    if len(bucket) >= limit:
-        raise HTTPException(429, "Too many requests")
-    bucket.append(now)
-
-
-def client_ip(request: Request) -> str:
-    if TRUST_PROXY:
-        fwd = request.headers.get("x-forwarded-for")
-        if fwd:
-            return fwd.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
-
-
-def is_https(request: Request) -> bool:
-    if TRUST_PROXY:
-        proto = request.headers.get("x-forwarded-proto")
-        if proto:
-            return proto == "https"
-    return request.url.scheme == "https"
-
-
-def deterministic_salt(email: str) -> str:
-    h = hmac.new(SECRET_KEY.encode(), b"preflight:" + email.encode(), hashlib.sha256)
-    return h.digest()[:16].hex()
-
-
-def set_cookie(response: Response, name: str, value: str, request: Request, http_only: bool):
-    response.set_cookie(
-        key=name, value=value, max_age=SESSION_TTL,
-        httponly=http_only, secure=is_https(request),
-        samesite="lax", path="/",
-    )
-
-
-def make_session(user_id: int, request: Request, response: Response):
-    sid = secrets.token_urlsafe(32)
-    csrf = secrets.token_urlsafe(24)
-    now = int(time.time())
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO sessions (id, user_id, csrf, created_at, expires_at, user_agent, ip) VALUES (?,?,?,?,?,?,?)",
-            (sid, user_id, csrf, now, now + SESSION_TTL,
-             (request.headers.get("user-agent") or "")[:300], client_ip(request)),
-        )
-    set_cookie(response, SESSION_COOKIE, sid, request, http_only=True)
-    set_cookie(response, CSRF_COOKIE, csrf, request, http_only=False)
-
-
-def current_user(request: Request) -> Optional[sqlite3.Row]:
-    sid = request.cookies.get(SESSION_COOKIE)
-    if not sid:
-        return None
-    with db() as conn:
-        row = conn.execute(
-            """SELECT u.id, u.email, u.auth_salt, u.auth_hash, u.created_at, u.last_login_at,
-                      s.id AS sess_id, s.csrf AS sess_csrf, s.expires_at AS sess_exp
-                 FROM sessions s JOIN users u ON u.id = s.user_id
-                WHERE s.id = ?""",
-            (sid,)
-        ).fetchone()
-    if not row or row["sess_exp"] < int(time.time()):
-        return None
-    return row
-
-
-def require_user(request: Request):
-    user = current_user(request)
-    if not user:
-        raise HTTPException(401, "Not authenticated")
-    return user
-
-
-def require_csrf(request: Request, user):
-    if request.method in ("GET", "HEAD", "OPTIONS"):
-        return
-    header = request.headers.get(CSRF_HEADER)
-    cookie = request.cookies.get(CSRF_COOKIE)
-    if not header or not cookie:
-        raise HTTPException(403, "CSRF token missing")
-    if not secrets.compare_digest(header, cookie):
-        raise HTTPException(403, "CSRF token mismatch")
-    if not secrets.compare_digest(header, user["sess_csrf"]):
-        raise HTTPException(403, "CSRF token invalid")
-
-
-def auth_dep(request: Request):
-    user = require_user(request)
-    require_csrf(request, user)
-    return user
-
-
-class PreflightIn(BaseModel):
-    email: str = Field(min_length=3, max_length=254)
-
-
-class RegisterIn(BaseModel):
-    email: str = Field(min_length=3, max_length=254)
-    authSalt: str = Field(pattern="^[0-9a-fA-F]{32}$")
-    authHash: str = Field(pattern="^[0-9a-fA-F]{64}$")
-    registrationToken: Optional[str] = None
-
-
-class LoginIn(BaseModel):
-    email: str
-    authHash: str = Field(pattern="^[0-9a-fA-F]{64}$")
-
-
-class VaultItemIn(BaseModel):
-    labelCt: str = Field(min_length=1, max_length=4096)
-    payloadCt: str = Field(min_length=1, max_length=131072)
-    pinned: bool = False
-
-
-class HistoryIn(BaseModel):
-    op: str = Field(pattern="^(encrypt|decrypt)$")
-    previewCt: str = Field(max_length=8192)
-
-
-class ChangePwIn(BaseModel):
-    currentAuthHash: str = Field(pattern="^[0-9a-fA-F]{64}$")
-    newAuthSalt: str = Field(pattern="^[0-9a-fA-F]{32}$")
-    newAuthHash: str = Field(pattern="^[0-9a-fA-F]{64}$")
-    rewrappedItems: list[dict]
-
-
-class DeleteAccountIn(BaseModel):
-    authHash: str = Field(pattern="^[0-9a-fA-F]{64}$")
-
-
-class BaseMessageIn(BaseModel):
-    ciphertext: str = Field(min_length=1, max_length=131072)
-    hint: Optional[str] = Field(default=None, max_length=120)
-    replyToId: Optional[int] = None
-    mediaIds: Optional[list[str]] = Field(default=None, max_items=20)
-
-
-class MessageIn(BaseMessageIn):
-    recipientId: int
-
-
-class GroupMessageIn(BaseMessageIn):
-    pass
-
-
-class PushSubscriptionIn(BaseModel):
-    subscription: dict
-
-
-class BlockIn(BaseModel):
-    userId: int
-
-
-class ReportIn(BaseModel):
-    reportedUserId: Optional[int] = None
-    messageId: Optional[int] = None
-    groupMessageId: Optional[int] = None
-    reason: str = Field(min_length=5, max_length=500)
-    details: Optional[str] = Field(default=None, max_length=2000)
-
-
-class InviteToGroupIn(BaseModel):
-    email: str = Field(min_length=3, max_length=254)
-    # The inviter must pre-wrap the group key for the invitee's public key
-    # (or derive it via the group passphrase on the client) before sending.
-    wrappedKeyForInvitee: str = Field(min_length=1, max_length=4096)
-
-
-class AcceptInviteIn(BaseModel):
-    # The invitee may optionally re-wrap the key (e.g. to a different local
-    # key format); if omitted the server uses the key the inviter stored.
-    wrappedKey: Optional[str] = Field(default=None, min_length=1, max_length=4096)
-
-
-app = FastAPI(title="ASCII Cipher Vault", openapi_url=None, docs_url=None, redoc_url=None)
-
-
-@app.on_event("startup")
-def _startup():
-    init_db()
-
-
-@app.middleware("http")
-async def security_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
-    response.headers["Permissions-Policy"] = "interest-cohort=(), browsing-topics=()"
-    if not request.url.path.startswith("/static/"):
-        response.headers["Cache-Control"] = "no-store"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; "
-        "script-src 'self'; "
-        "style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data: blob:; "
-        "media-src 'self' blob:; "
-        "connect-src 'self'; "
-        "frame-ancestors 'none'; "
-        "base-uri 'self'; "
-        "form-action 'self'"
-    )
-    return response
-
-
-@app.post("/api/auth/preflight")
-def preflight(body: PreflightIn, request: Request):
-    rate_limit(f"preflight:{client_ip(request)}", 30, 60)
-    email = body.email.lower().strip()
-    if not EMAIL_RE.match(email):
-        return {"authSalt": deterministic_salt(email), "iterations": PBKDF2_ITERATIONS}
-    with db() as conn:
-        row = conn.execute("SELECT auth_salt FROM users WHERE email = ?", (email,)).fetchone()
-    salt_hex = row["auth_salt"].hex() if row else deterministic_salt(email)
-    return {"authSalt": salt_hex, "iterations": PBKDF2_ITERATIONS}
-
-
-@app.post("/api/auth/register", status_code=201)
-def register(body: RegisterIn, request: Request, response: Response):
-    rate_limit(f"register:{client_ip(request)}", 10, 3600)
-    if REGISTRATION_TOKEN:
-        if not body.registrationToken or not secrets.compare_digest(body.registrationToken, REGISTRATION_TOKEN):
-            raise HTTPException(403, "Invalid registration token")
-    email = body.email.lower().strip()
-    if not EMAIL_RE.match(email):
-        raise HTTPException(400, "Invalid email")
-    salt_bytes = bytes.fromhex(body.authSalt)
-    auth_hash_stored = hasher.hash(body.authHash.lower())
-    now = int(time.time())
-    with db() as conn:
-        try:
-            cur = conn.execute(
-                "INSERT INTO users (email, auth_salt, auth_hash, created_at, last_login_at) VALUES (?,?,?,?,?)",
-                (email, salt_bytes, auth_hash_stored, now, now)
-            )
-        except sqlite3.IntegrityError:
-            raise HTTPException(409, "Email already registered")
-        user_id = cur.lastrowid
-    make_session(user_id, request, response)
-    return {"id": user_id, "email": email, "createdAt": now}
-
-
-@app.post("/api/auth/login")
-def login(body: LoginIn, request: Request, response: Response):
-    rate_limit(f"login:{client_ip(request)}", 10, 60)
-    email = body.email.lower().strip()
-    with db() as conn:
-        row = conn.execute("SELECT id, auth_hash FROM users WHERE email = ?", (email,)).fetchone()
-    if not row:
-        raise HTTPException(401, "Invalid credentials")
-    try:
-        hasher.verify(row["auth_hash"], body.authHash.lower())
-    except (VerifyMismatchError, InvalidHash):
-        raise HTTPException(401, "Invalid credentials")
-    make_session(row["id"], request, response)
-    _log_login(row["id"], request)
-    with db() as conn:
-        conn.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (int(time.time()), row["id"]))
-    return {"id": row["id"], "email": email}
-
-
-@app.post("/api/auth/verify")
-def verify_password(body: LoginIn, user = Depends(auth_dep)):
-    if user["email"] != body.email.lower().strip():
-        raise HTTPException(403, "Email mismatch")
-    try:
-        hasher.verify(user["auth_hash"], body.authHash.lower())
-    except (VerifyMismatchError, InvalidHash):
-        raise HTTPException(401, "Wrong password")
-    return {"ok": True}
-
-
-@app.post("/api/auth/logout")
-def logout(request: Request, response: Response):
-    sid = request.cookies.get(SESSION_COOKIE)
-    if sid:
-        with db() as conn:
-            conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
-    response.delete_cookie(SESSION_COOKIE, path="/")
-    response.delete_cookie(CSRF_COOKIE, path="/")
-    return Response(status_code=204)
-
-
-@app.get("/api/auth/me")
-def me(user = Depends(require_user)):
-    return {
-        "id": user["id"],
-        "email": user["email"],
-        "authSalt": user["auth_salt"].hex(),
-        "createdAt": user["created_at"],
-        "lastLoginAt": user["last_login_at"],
-        "iterations": PBKDF2_ITERATIONS,
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SecureVault — Encrypted Messaging & Storage</title>
+<style>
+  :root {
+    --bg: #1a1a2e;
+    --surface: #252540;
+    --surface-hi: #2d2d4d;
+    --surface-hover: #313157;
+    --border: rgba(108, 99, 255, 0.18);
+    --border-soft: rgba(255, 255, 255, 0.06);
+    --accent: #6c63ff;
+    --accent-hi: #8a83ff;
+    --accent-dim: rgba(108, 99, 255, 0.15);
+    --accent2: #43c9a0;
+    --accent2-hi: #5fdcb6;
+    --warn: #e05c5c;
+    --warn-hi: #f07878;
+    --gold: #e0a030;
+    --fg: #e8e8f0;
+    --fg-dim: #7a7a99;
+    --fg-hi: #ffffff;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Consolas, "Liberation Mono", monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background:
+      radial-gradient(circle at 18% -10%, rgba(108, 99, 255, 0.18), transparent 45%),
+      radial-gradient(circle at 90% 110%, rgba(67, 201, 160, 0.12), transparent 45%),
+      var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", system-ui, sans-serif;
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+    overflow: hidden;
+  }
+
+  button, input, textarea, select { font-family: inherit; color: inherit; }
+  textarea { resize: none; }
+
+  .container {
+    display: flex;
+    height: 100vh;
+  }
+
+  /* ── Sidebar ── */
+  .sidebar {
+    width: 280px;
+    background: var(--surface);
+    border-right: 1px solid var(--border-soft);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .sidebar-header {
+    padding: 16px;
+    border-bottom: 1px solid var(--border-soft);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .logo-mini {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 600;
+    font-size: 15px;
+  }
+
+  .logo-icon {
+    width: 28px;
+    height: 28px;
+    border-radius: 7px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    display: grid;
+    place-items: center;
+    font-size: 14px;
+  }
+
+  .user-btn {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    background: var(--surface-hi);
+    border: 1px solid var(--border-soft);
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+    font-weight: 600;
+    font-size: 12px;
+    transition: all 0.15s;
+  }
+
+  .user-btn:hover {
+    background: var(--surface-hover);
+  }
+
+  .tabs {
+    display: flex;
+    gap: 0;
+    padding: 8px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+
+  .tab-btn {
+    flex: 1;
+    padding: 8px 12px;
+    border: none;
+    background: transparent;
+    color: var(--fg-dim);
+    cursor: pointer;
+    font-size: 12px;
+    border-radius: 6px;
+    transition: all 0.15s;
+  }
+
+  .tab-btn:hover {
+    background: var(--surface-hi);
+  }
+
+  .tab-btn.active {
+    background: var(--accent-dim);
+    color: var(--accent-hi);
+    font-weight: 600;
+  }
+
+  .sidebar-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+  }
+
+  .list-item {
+    padding: 10px 12px;
+    margin-bottom: 6px;
+    background: var(--surface-hi);
+    border: 1px solid transparent;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-size: 13px;
+  }
+
+  .list-item:hover {
+    background: var(--surface-hover);
+    border-color: var(--border-soft);
+  }
+
+  .list-item.active {
+    background: var(--accent-dim);
+    color: var(--accent-hi);
+    border-color: var(--accent);
+  }
+
+  .list-empty {
+    padding: 24px 12px;
+    text-align: center;
+    color: var(--fg-dim);
+    font-size: 12px;
+  }
+
+  /* ── Main content ── */
+  .main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .auth-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: var(--bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+  }
+
+  .auth-card {
+    background: var(--surface);
+    border: 1px solid var(--border-soft);
+    border-radius: 14px;
+    padding: 32px;
+    max-width: 420px;
+    width: 90%;
+  }
+
+  .auth-card h2 {
+    font-size: 24px;
+    margin-bottom: 8px;
+  }
+
+  .auth-card p {
+    color: var(--fg-dim);
+    font-size: 13px;
+    margin-bottom: 24px;
+  }
+
+  .auth-form input {
+    width: 100%;
+    padding: 10px 12px;
+    background: var(--surface-hi);
+    border: 1px solid var(--border-soft);
+    border-radius: 8px;
+    color: var(--fg);
+    margin-bottom: 12px;
+    font-size: 14px;
+  }
+
+  .auth-form input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-dim);
+  }
+
+  .auth-tabs {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+
+  .auth-tab {
+    flex: 1;
+    padding: 10px;
+    background: var(--surface-hi);
+    border: 1px solid transparent;
+    border-radius: 8px;
+    cursor: pointer;
+    color: var(--fg-dim);
+    font-weight: 500;
+    transition: all 0.15s;
+  }
+
+  .auth-tab.active {
+    background: var(--accent);
+    color: white;
+  }
+
+  .auth-submit {
+    width: 100%;
+    padding: 12px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-hi));
+    color: white;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-weight: 600;
+    transition: all 0.15s;
+  }
+
+  .auth-submit:hover {
+    box-shadow: 0 0 12px rgba(108, 99, 255, 0.5);
+  }
+
+  .auth-submit:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .hidden {
+    display: none !important;
+  }
+
+  /* ── Content panels ── */
+  .panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .panel-header {
+    padding: 16px;
+    border-bottom: 1px solid var(--border-soft);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .panel-title {
+    font-size: 15px;
+    font-weight: 600;
+  }
+
+  .panel-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+  }
+
+  .panel-footer {
+    padding: 16px;
+    border-top: 1px solid var(--border-soft);
+  }
+
+  .input-group {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+
+  .input-group input,
+  .input-group textarea {
+    flex: 1;
+    padding: 10px 12px;
+    background: var(--surface-hi);
+    border: 1px solid var(--border-soft);
+    border-radius: 8px;
+    color: var(--fg);
+    font-size: 13px;
+  }
+
+  .input-group input:focus,
+  .input-group textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-dim);
+  }
+
+  .btn {
+    padding: 10px 16px;
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-weight: 600;
+    transition: all 0.15s;
+    font-size: 13px;
+  }
+
+  .btn:hover {
+    box-shadow: 0 0 12px rgba(108, 99, 255, 0.5);
+  }
+
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .btn.secondary {
+    background: var(--surface-hi);
+    color: var(--fg);
+    border: 1px solid var(--border-soft);
+  }
+
+  .btn.secondary:hover {
+    background: var(--surface-hover);
+  }
+
+  /* ── Vault items ── */
+  .vault-item {
+    padding: 12px;
+    background: var(--surface-hi);
+    border: 1px solid var(--border-soft);
+    border-radius: 8px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .vault-item:hover {
+    border-color: var(--accent);
+    background: var(--surface-hover);
+  }
+
+  .vault-item-label {
+    font-weight: 600;
+    font-size: 13px;
+    margin-bottom: 4px;
+  }
+
+  .vault-item-meta {
+    font-size: 11px;
+    color: var(--fg-dim);
+  }
+
+  .vault-item.pinned {
+    border-color: var(--gold);
+    background: rgba(224, 160, 48, 0.1);
+  }
+
+  /* ── Messages ── */
+  .message {
+    margin-bottom: 12px;
+    padding: 12px;
+    border-radius: 8px;
+    background: var(--surface-hi);
+    border-left: 3px solid var(--accent);
+  }
+
+  .message.other {
+    border-left-color: var(--accent2);
+  }
+
+  .message-sender {
+    font-size: 11px;
+    color: var(--fg-dim);
+    margin-bottom: 4px;
+    font-weight: 600;
+  }
+
+  .message-text {
+    font-size: 13px;
+    line-height: 1.4;
+    word-break: break-word;
+  }
+
+  .message-time {
+    font-size: 10px;
+    color: var(--fg-dim);
+    margin-top: 6px;
+  }
+
+  /* ── History ── */
+  .history-item {
+    padding: 10px;
+    background: var(--surface-hi);
+    border-radius: 8px;
+    margin-bottom: 6px;
+    font-size: 12px;
+  }
+
+  .history-item-type {
+    color: var(--accent2);
+    font-weight: 600;
+    margin-bottom: 2px;
+  }
+
+  .history-item-text {
+    color: var(--fg-dim);
+    font-family: var(--mono);
+    word-break: break-all;
+  }
+
+  .history-item-time {
+    font-size: 10px;
+    color: var(--fg-dim);
+    margin-top: 4px;
+  }
+
+  /* ── Toasts ── */
+  #toasts {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    z-index: 999;
+    max-width: 380px;
+  }
+
+  .toast {
+    background: var(--surface);
+    border: 1px solid var(--border-soft);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+    animation: toast-in 0.3s ease;
+  }
+
+  .toast.info {
+    border-color: var(--accent);
+  }
+
+  .toast.error {
+    border-color: var(--warn);
+  }
+
+  .toast.success {
+    border-color: var(--accent2);
+  }
+
+  .toast.fade-out {
+    animation: toast-out 0.4s ease forwards;
+  }
+
+  .t-title {
+    color: var(--fg-hi);
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+
+  .t-body {
+    color: var(--fg-dim);
+    font-size: 12px;
+    line-height: 1.4;
+  }
+
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  @keyframes toast-out {
+    from { opacity: 1; transform: translateY(0); }
+    to { opacity: 0; transform: translateY(20px); }
+  }
+
+  @media (max-width: 768px) {
+    .sidebar {
+      width: 100%;
+      max-height: 40vh;
+    }
+    .container {
+      flex-direction: column;
+    }
+  }
+</style>
+</head>
+<body>
+
+<div id="auth-overlay" class="auth-overlay">
+  <div class="auth-card">
+    <h2>SecureVault</h2>
+    <p>Encrypted messaging & storage</p>
+    <div class="auth-tabs">
+      <div class="auth-tab active" id="tab-login" onclick="setAuthMode('login')">Sign In</div>
+      <div class="auth-tab" id="tab-register" onclick="setAuthMode('register')">Register</div>
+    </div>
+    <div class="auth-form">
+      <input type="email" id="auth-email" placeholder="Email address" autocomplete="email">
+      <input type="password" id="auth-pass" placeholder="Passphrase" autocomplete="current-password">
+      <div id="reg-token-field" style="display:none;">
+        <input type="text" id="auth-token" placeholder="Registration token (optional)" autocomplete="off">
+      </div>
+      <button class="auth-submit" id="auth-submit">Sign in</button>
+    </div>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <div class="container">
+    <div class="sidebar">
+      <div class="sidebar-header">
+        <div class="logo-mini">
+          <div class="logo-icon">🔐</div>
+          <span>SecureVault</span>
+        </div>
+        <button class="user-btn" id="user-avatar" onclick="showLogout()" title="Logout"></button>
+      </div>
+
+      <div class="tabs">
+        <button class="tab-btn active" onclick="switchSidebarTab('vault')">Vault</button>
+        <button class="tab-btn" onclick="switchSidebarTab('messages')">Messages</button>
+        <button class="tab-btn" onclick="switchSidebarTab('history')">History</button>
+      </div>
+
+      <div class="sidebar-content">
+        <div id="vault-list-panel">
+          <input type="text" id="vault-search" placeholder="Search vault..." style="width:100%; padding:8px; background:var(--surface-hi); border:1px solid var(--border-soft); border-radius:6px; color:var(--fg); margin-bottom:8px;" oninput="renderVault()">
+          <div id="vault-list" class="list-empty">Loading vault...</div>
+        </div>
+        <div id="messages-list-panel" style="display:none;">
+          <div id="thread-list" class="list-empty">Loading messages...</div>
+        </div>
+        <div id="history-list-panel" style="display:none;">
+          <div id="history-list" class="list-empty">No history yet</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="main">
+      <div id="vault-panel" class="panel">
+        <div class="panel-header">
+          <div class="panel-title">Vault</div>
+          <button class="btn secondary" onclick="showNewVaultForm()">+ New</button>
+        </div>
+        <div class="panel-content">
+          <div id="vault-detail"></div>
+        </div>
+      </div>
+
+      <div id="messages-panel" class="panel hidden">
+        <div class="panel-header">
+          <div class="panel-title" id="thread-title">Messages</div>
+        </div>
+        <div class="panel-content">
+          <div id="message-list"></div>
+        </div>
+        <div class="panel-footer">
+          <div class="input-group">
+            <input type="text" id="recipient-lookup" placeholder="Find user by email..." onkeypress="handleLookupKeypress(event)" style="margin-bottom:0;">
+            <button class="btn" onclick="lookupUser()" style="width:auto;">Find</button>
+          </div>
+          <div class="input-group">
+            <input type="text" id="message-input" placeholder="Type a message..." onkeypress="handleMessageKeypress(event)" style="margin-bottom:0;">
+            <button class="btn" onclick="sendMessage()" style="width:auto;">Send</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="cipher-panel" class="panel hidden">
+        <div class="panel-header">
+          <div class="panel-title">Cipher Tool</div>
+        </div>
+        <div class="panel-content">
+          <div style="margin-bottom:16px;">
+            <label style="display:block; margin-bottom:8px; color:var(--fg-dim); font-size:12px;">Key</label>
+            <input type="password" id="cipher-key" placeholder="Enter encryption key" style="width:100%; padding:10px; background:var(--surface-hi); border:1px solid var(--border-soft); border-radius:6px; color:var(--fg);">
+          </div>
+          <div style="margin-bottom:16px;">
+            <label style="display:block; margin-bottom:8px; color:var(--fg-dim); font-size:12px;">Input</label>
+            <textarea id="cipher-input" placeholder="Text to encrypt/decrypt" style="width:100%; height:100px; padding:10px; background:var(--surface-hi); border:1px solid var(--border-soft); border-radius:6px; color:var(--fg); font-family:var(--mono);"></textarea>
+          </div>
+          <div class="input-group">
+            <button class="btn" onclick="cipherEncrypt()" style="flex:1;">🔒 Encrypt</button>
+            <button class="btn secondary" onclick="cipherDecrypt()" style="flex:1;">🔓 Decrypt</button>
+          </div>
+          <div style="margin-top:16px;">
+            <label style="display:block; margin-bottom:8px; color:var(--fg-dim); font-size:12px;">Output</label>
+            <textarea id="cipher-output" placeholder="Result will appear here" readonly style="width:100%; height:100px; padding:10px; background:var(--surface-hi); border:1px solid var(--border-soft); border-radius:6px; color:var(--fg); font-family:var(--mono);"></textarea>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script>
+"use strict";
+
+/* ─────────────────────────────────────────────────────────────
+   CRYPTO CORE
+   ───────────────────────────────────────────────────────────── */
+const SALT_LEN = 16;
+const ITERATIONS = 200_000;
+const KEY_LEN = 32;
+const subtle = crypto.subtle;
+
+async function deriveKeys(password, salt) {
+  const baseKey = await subtle.importKey(
+    "raw",
+    new TextEncoder().encode(password),
+    { name: "PBKDF2" },
+    false,
+    ["deriveBits"]
+  );
+  const bits = await subtle.deriveBits(
+    { name: "PBKDF2", salt, iterations: ITERATIONS, hash: "SHA-256" },
+    baseKey,
+    KEY_LEN * 2 * 8
+  );
+  const km = new Uint8Array(bits);
+  return [km.slice(0, KEY_LEN), km.slice(KEY_LEN)];
+}
+
+async function deriveAuthHash(password, salt) {
+  // Derive a 64-byte key from password+salt using PBKDF2
+  // The first 32 bytes will be used as the authHash
+  const baseKey = await subtle.importKey(
+    "raw",
+    new TextEncoder().encode(password),
+    { name: "PBKDF2" },
+    false,
+    ["deriveBits"]
+  );
+  const bits = await subtle.deriveBits(
+    { name: "PBKDF2", salt, iterations: ITERATIONS, hash: "SHA-256" },
+    baseKey,
+    KEY_LEN * 8  // 32 bytes
+  );
+  return bytesToHex(new Uint8Array(bits));
+}
+
+async function keystream(encKey, salt, length) {
+  const out = new Uint8Array(length);
+  const buf = new Uint8Array(encKey.length + salt.length + 4);
+  buf.set(encKey, 0);
+  buf.set(salt, encKey.length);
+  const counterView = new DataView(buf.buffer, encKey.length + salt.length, 4);
+  let counter = 0;
+  let off = 0;
+  while (off < length) {
+    counterView.setUint32(0, counter, false);
+    const digest = new Uint8Array(await subtle.digest("SHA-256", buf));
+    const take = Math.min(digest.length, length - off);
+    out.set(digest.subarray(0, take), off);
+    off += take;
+    counter += 1;
+  }
+  return out;
+}
+
+async function hmacSha256(key, data) {
+  const k = await subtle.importKey(
+    "raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+  );
+  return new Uint8Array(await subtle.sign("HMAC", k, data));
+}
+
+function bytesToHex(b) {
+  let s = "";
+  for (let i = 0; i < b.length; i++) s += b[i].toString(16).padStart(2, "0");
+  return s;
+}
+
+function hexToBytes(hex) {
+  if (hex.length % 2) throw new Error("bad hex");
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    const v = parseInt(hex.substr(i * 2, 2), 16);
+    if (Number.isNaN(v)) throw new Error("bad hex");
+    out[i] = v;
+  }
+  return out;
+}
+
+function ctEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a[i] ^ b[i];
+  return r === 0;
+}
+
+async function encryptText(plaintext, password) {
+  const data = new TextEncoder().encode(plaintext);
+  const salt = crypto.getRandomValues(new Uint8Array(SALT_LEN));
+  const [encKey, macKey] = await deriveKeys(password, salt);
+  const ks = await keystream(encKey, salt, data.length);
+  const ct = new Uint8Array(data.length);
+  for (let i = 0; i < data.length; i++) ct[i] = data[i] ^ ks[i];
+  const macInput = new Uint8Array(salt.length + ct.length);
+  macInput.set(salt, 0);
+  macInput.set(ct, salt.length);
+  const tag = await hmacSha256(macKey, macInput);
+  return `${bytesToHex(salt)}:${bytesToHex(ct)}:${bytesToHex(tag)}`;
+}
+
+async function decryptToken(token, password) {
+  const parts = token.trim().split(":");
+  if (parts.length !== 3) return { ok: false, err: "invalid format" };
+  let salt, ct, tag;
+  try {
+    salt = hexToBytes(parts[0]);
+    ct = hexToBytes(parts[1]);
+    tag = hexToBytes(parts[2]);
+  } catch {
+    return { ok: false, err: "decryption failed" };
+  }
+  if (salt.length !== SALT_LEN) return { ok: false, err: "invalid format" };
+  const [encKey, macKey] = await deriveKeys(password, salt);
+  const macInput = new Uint8Array(salt.length + ct.length);
+  macInput.set(salt, 0);
+  macInput.set(ct, salt.length);
+  const expected = await hmacSha256(macKey, macInput);
+  if (!ctEqual(tag, expected)) return { ok: false, err: "wrong key or tampered" };
+  const ks = await keystream(encKey, salt, ct.length);
+  const pt = new Uint8Array(ct.length);
+  for (let i = 0; i < ct.length; i++) pt[i] = ct[i] ^ ks[i];
+  try {
+    return { ok: true, text: new TextDecoder("utf-8", { fatal: false }).decode(pt) };
+  } catch {
+    return { ok: false, err: "decryption failed" };
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────
+   STATE & GLOBALS
+   ───────────────────────────────────────────────────────────── */
+let currentUser = null;
+let masterPass = null;
+let authMode = "login";
+let vaultItems = [];
+let threads = [];
+let history = [];
+let currentThreadId = null;
+let currentPeerId = null;
+let currentVaultItemId = null;
+
+/* ─────────────────────────────────────────────────────────────
+   UTILITY FUNCTIONS
+   ───────────────────────────────────────────────────────────── */
+function toast(body, kind = "info", title = null) {
+  const el = document.createElement("div");
+  el.className = `toast ${kind}`;
+  el.innerHTML = `${title ? `<div class="t-title">${title}</div>` : ""}<div class="t-body"></div>`;
+  el.querySelector(".t-body").textContent = body;
+  document.getElementById("toasts").appendChild(el);
+  setTimeout(() => {
+    el.classList.add("fade-out");
+    el.addEventListener("animationend", () => el.remove(), { once: true });
+  }, 2400);
+}
+
+function escHtml(str) {
+  const div = document.createElement("div");
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+function relTime(ts) {
+  if (!ts) return "now";
+  const now = Math.floor(Date.now() / 1000);
+  const diff = now - ts;
+  if (diff < 60) return "now";
+  if (diff < 3600) return Math.floor(diff / 60) + "m ago";
+  if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
+  return Math.floor(diff / 86400) + "d ago";
+}
+
+async function api(method, path, body = null) {
+  const opts = {
+    method,
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+  };
+  if (body !== null) opts.body = JSON.stringify(body);
+  const res = await fetch(path, opts);
+  
+  const contentType = res.headers.get("content-type") || "";
+  if (res.status === 204) return null;
+  
+  if (!contentType.includes("application/json")) {
+    const text = await res.text();
+    throw new Error(`Server error: ${res.status}`);
+  }
+  
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || data.error || `Error: ${res.status}`);
+  return data;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   AUTH FUNCTIONS
+   ───────────────────────────────────────────────────────────── */
+function setAuthMode(mode) {
+  authMode = mode;
+  document.getElementById("tab-login").classList.toggle("active", mode === "login");
+  document.getElementById("tab-register").classList.toggle("active", mode === "register");
+  document.getElementById("auth-submit").textContent = mode === "login" ? "Sign in" : "Create account";
+  document.getElementById("reg-token-field").style.display = mode === "register" ? "block" : "none";
+  document.getElementById("auth-pass").autocomplete = mode === "login" ? "current-password" : "new-password";
+}
+
+async function doAuth() {
+  const email = document.getElementById("auth-email").value.trim();
+  const pass = document.getElementById("auth-pass").value;
+  
+  if (!email || !pass) {
+    toast("Email and passphrase required", "error");
+    return;
+  }
+
+  const btn = document.getElementById("auth-submit");
+  btn.disabled = true;
+  btn.textContent = "Working…";
+
+  try {
+    // Step 1: Get salt from preflight
+    const preflight = await api("POST", "/api/auth/preflight", { email });
+    const saltHex = preflight.authSalt;
+    const salt = hexToBytes(saltHex);
+    
+    // Step 2: Derive authHash from password
+    const authHash = await deriveAuthHash(pass, salt);
+
+    let result;
+    
+    if (authMode === "login") {
+      result = await api("POST", "/api/auth/login", {
+        email,
+        authHash
+      });
+    } else {
+      const token = document.getElementById("auth-token").value;
+      result = await api("POST", "/api/auth/register", {
+        email,
+        authSalt: saltHex,
+        authHash,
+        registrationToken: token || null
+      });
     }
 
-
-@app.post("/api/auth/change-password")
-def change_password(body: ChangePwIn, user = Depends(auth_dep)):
-    try:
-        hasher.verify(user["auth_hash"], body.currentAuthHash.lower())
-    except (VerifyMismatchError, InvalidHash):
-        raise HTTPException(403, "Current password incorrect")
-    new_salt = bytes.fromhex(body.newAuthSalt)
-    new_hash = hasher.hash(body.newAuthHash.lower())
-    now = int(time.time())
-    with db() as conn:
-        conn.execute("BEGIN")
-        try:
-            conn.execute("UPDATE users SET auth_salt = ?, auth_hash = ? WHERE id = ?",
-                         (new_salt, new_hash, user["id"]))
-            for item in body.rewrappedItems:
-                if not isinstance(item, dict):
-                    continue
-                iid = item.get("id"); l = item.get("labelCt"); p = item.get("payloadCt")
-                if not isinstance(iid, int) or not isinstance(l, str) or not isinstance(p, str):
-                    continue
-                conn.execute(
-                    "UPDATE vault_items SET label_ct=?, payload_ct=?, updated_at=? WHERE id=? AND user_id=?",
-                    (l, p, now, iid, user["id"])
-                )
-            conn.execute("DELETE FROM sessions WHERE user_id = ? AND id != ?", (user["id"], user["sess_id"]))
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise HTTPException(500, "Update failed")
-    return {"ok": True}
-
-
-@app.post("/api/auth/delete-account")
-def delete_account(body: DeleteAccountIn, response: Response, user = Depends(auth_dep)):
-    try:
-        hasher.verify(user["auth_hash"], body.authHash.lower())
-    except (VerifyMismatchError, InvalidHash):
-        raise HTTPException(403, "Password incorrect")
-    now = int(time.time())
-    with db() as conn:
-        # Archive sent and received DMs before delete
-        try:
-            conn.execute("""
-                INSERT INTO archived_messages (original_msg_id, sender_id, recipient_id, ciphertext, hint, created_at, archived_at)
-                SELECT id, sender_id, recipient_id, ciphertext, hint, created_at, ?
-                FROM messages WHERE sender_id = ? OR recipient_id = ?
-            """, (now, user["id"], user["id"]))
-        except Exception:
-            pass  # Archive may fail if table doesn't exist yet
-        conn.execute("DELETE FROM users WHERE id = ?", (user["id"],))
-    response.delete_cookie(SESSION_COOKIE, path="/")
-    response.delete_cookie(CSRF_COOKIE, path="/")
-    return Response(status_code=204)
-
-
-@app.get("/api/vault")
-def vault_list(user = Depends(require_user)):
-    with db() as conn:
-        rows = conn.execute(
-            """SELECT id, label_ct, payload_ct, pinned, created_at, updated_at
-                 FROM vault_items WHERE user_id = ?
-              ORDER BY pinned DESC, updated_at DESC""",
-            (user["id"],)
-        ).fetchall()
-    return [{"id": r["id"], "labelCt": r["label_ct"], "payloadCt": r["payload_ct"],
-             "pinned": bool(r["pinned"]), "createdAt": r["created_at"], "updatedAt": r["updated_at"]} for r in rows]
-
-
-@app.post("/api/vault", status_code=201)
-def vault_create(body: VaultItemIn, user = Depends(auth_dep)):
-    now = int(time.time())
-    with db() as conn:
-        cur = conn.execute(
-            "INSERT INTO vault_items (user_id, label_ct, payload_ct, pinned, created_at, updated_at) VALUES (?,?,?,?,?,?)",
-            (user["id"], body.labelCt, body.payloadCt, int(body.pinned), now, now)
-        )
-    return {"id": cur.lastrowid, "labelCt": body.labelCt, "payloadCt": body.payloadCt,
-            "pinned": body.pinned, "createdAt": now, "updatedAt": now}
-
-
-@app.put("/api/vault/{item_id}")
-def vault_update(item_id: int, body: VaultItemIn, user = Depends(auth_dep)):
-    now = int(time.time())
-    with db() as conn:
-        cur = conn.execute(
-            "UPDATE vault_items SET label_ct=?, payload_ct=?, pinned=?, updated_at=? WHERE id=? AND user_id=?",
-            (body.labelCt, body.payloadCt, int(body.pinned), now, item_id, user["id"])
-        )
-        if cur.rowcount == 0:
-            raise HTTPException(404, "Not found")
-    return {"id": item_id, "labelCt": body.labelCt, "payloadCt": body.payloadCt,
-            "pinned": body.pinned, "updatedAt": now}
-
-
-@app.delete("/api/vault/{item_id}")
-def vault_delete(item_id: int, user = Depends(auth_dep)):
-    with db() as conn:
-        cur = conn.execute("DELETE FROM vault_items WHERE id = ? AND user_id = ?", (item_id, user["id"]))
-        if cur.rowcount == 0:
-            raise HTTPException(404, "Not found")
-    return Response(status_code=204)
-
-
-@app.get("/api/history")
-def history_list(user = Depends(require_user), limit: int = 100):
-    limit = max(1, min(limit, 500))
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT id, op, preview_ct, created_at FROM history WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
-            (user["id"], limit)
-        ).fetchall()
-    return [{"id": r["id"], "op": r["op"], "previewCt": r["preview_ct"], "createdAt": r["created_at"]} for r in rows]
-
-
-@app.post("/api/history", status_code=201)
-def history_add(body: HistoryIn, user = Depends(auth_dep)):
-    now = int(time.time())
-    with db() as conn:
-        cur = conn.execute(
-            "INSERT INTO history (user_id, op, preview_ct, created_at) VALUES (?,?,?,?)",
-            (user["id"], body.op, body.previewCt, now)
-        )
-        conn.execute(
-            """DELETE FROM history WHERE user_id = ? AND id NOT IN (
-                 SELECT id FROM history WHERE user_id = ? ORDER BY created_at DESC LIMIT 200
-               )""",
-            (user["id"], user["id"])
-        )
-    return {"id": cur.lastrowid, "op": body.op, "previewCt": body.previewCt, "createdAt": now}
-
-
-@app.delete("/api/history/{item_id}")
-def history_delete(item_id: int, user = Depends(auth_dep)):
-    with db() as conn:
-        conn.execute("DELETE FROM history WHERE id = ? AND user_id = ?", (item_id, user["id"]))
-    return Response(status_code=204)
-
-
-@app.delete("/api/history")
-def history_clear(user = Depends(auth_dep)):
-    with db() as conn:
-        conn.execute("DELETE FROM history WHERE user_id = ?", (user["id"],))
-    return Response(status_code=204)
-
-
-@app.get("/api/sessions")
-def sessions_list(user = Depends(require_user)):
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT id, created_at, expires_at, user_agent, ip FROM sessions WHERE user_id = ? ORDER BY created_at DESC",
-            (user["id"],)
-        ).fetchall()
-    return [{"id": r["id"], "current": r["id"] == user["sess_id"],
-             "createdAt": r["created_at"], "expiresAt": r["expires_at"],
-             "userAgent": r["user_agent"], "ip": r["ip"]} for r in rows]
-
-
-@app.delete("/api/sessions/{sess_id}")
-def sessions_revoke(sess_id: str, user = Depends(auth_dep)):
-    with db() as conn:
-        conn.execute("DELETE FROM sessions WHERE id = ? AND user_id = ?", (sess_id, user["id"]))
-    return Response(status_code=204)
-
-
-@app.post("/api/messages/lookup")
-def message_lookup(body: LookupIn, request: Request, user = Depends(auth_dep)):
-    rate_limit(f"lookup:{client_ip(request)}", 30, 60)
-    email = body.email.lower().strip()
-    if not EMAIL_RE.match(email):
-        raise HTTPException(400, "Invalid email")
-    if email == user["email"]:
-        raise HTTPException(400, "Cannot message yourself")
-    with db() as conn:
-        row = conn.execute("SELECT id, email FROM users WHERE email = ?", (email,)).fetchone()
-    if not row:
-        raise HTTPException(404, "No account with that email")
-    return {"id": row["id"], "email": row["email"]}
-
-
-@app.get("/api/messages/threads")
-def message_threads(user = Depends(require_user)):
-    uid = user["id"]
-    with db() as conn:
-        rows = conn.execute("""
-            WITH peers AS (
-              SELECT recipient_id AS peer_id FROM messages
-                WHERE sender_id = ? AND deleted_by_sender = 0
-              UNION
-              SELECT sender_id AS peer_id FROM messages
-                WHERE recipient_id = ? AND deleted_by_recipient = 0
-            )
-            SELECT p.peer_id, u.email,
-              (SELECT COUNT(*) FROM messages
-                 WHERE recipient_id = ? AND sender_id = p.peer_id
-                   AND read_at IS NULL AND deleted_by_recipient = 0) AS unread,
-              (SELECT MAX(created_at) FROM messages
-                 WHERE ((sender_id = ? AND recipient_id = p.peer_id AND deleted_by_sender = 0)
-                     OR (sender_id = p.peer_id AND recipient_id = ? AND deleted_by_recipient = 0))) AS last_at
-              FROM peers p JOIN users u ON u.id = p.peer_id
-             ORDER BY last_at DESC
-        """, (uid, uid, uid, uid, uid)).fetchall()
-    return [{"peerId": r["peer_id"], "peerEmail": r["email"],
-             "unread": r["unread"], "lastAt": r["last_at"]} for r in rows]
-
-
-@app.get("/api/messages")
-def messages_list(peer: int, limit: int = 200, user = Depends(require_user)):
-    limit = max(1, min(limit, 500))
-    uid = user["id"]
-    with db() as conn:
-        rows = conn.execute("""
-            SELECT id, sender_id, recipient_id, ciphertext, hint, created_at, read_at
-              FROM messages
-             WHERE ((sender_id = ? AND recipient_id = ? AND deleted_by_sender = 0)
-                 OR (sender_id = ? AND recipient_id = ? AND deleted_by_recipient = 0))
-             ORDER BY created_at DESC
-             LIMIT ?
-        """, (uid, peer, peer, uid, limit)).fetchall()
-    return [{
-        "id": r["id"],
-        "fromMe": r["sender_id"] == uid,
-        "senderId": r["sender_id"],
-        "recipientId": r["recipient_id"],
-        "ciphertext": r["ciphertext"],
-        "hint": r["hint"],
-        "createdAt": r["created_at"],
-        "readAt": r["read_at"],
-    } for r in rows]
-
-
-def _fire_push(recipient_ids: list, title: str, body_text: str):
-    """Fire-and-forget push notification to a list of user IDs (runs in background thread)."""
-    import json, threading
-    def _send():
-        for uid in recipient_ids:
-            try:
-                with db() as conn:
-                    subs = conn.execute(
-                        "SELECT id, subscription_json FROM push_subscriptions WHERE user_id = ?",
-                        (uid,)
-                    ).fetchall()
-                for sub in subs:
-                    try:
-                        sub_data = json.loads(sub["subscription_json"])
-                        endpoint = sub_data.get("endpoint", "")
-                        # Real Web Push would POST to endpoint with encrypted payload.
-                        # Requires VAPID keys + pywebpush library. Logged for now.
-                        print(f"[push] → {endpoint[:60]}… | {title}: {body_text[:40]}")
-                    except Exception as e:
-                        print(f"[push] error: {e}")
-            except Exception as e:
-                print(f"[push] db error: {e}")
-    threading.Thread(target=_send, daemon=True).start()
-
-
-def _grant_media_access(conn, media_ids: list[str], uploader_id: int, recipient_ids: list[int]):
-    """Grant recipients access to uploaded media owned by uploader_id."""
-
-    if not media_ids or not recipient_ids:
-        return
-
-    now = int(time.time())
-
-    deduped_media_ids = list(dict.fromkeys(media_ids))
-    deduped_recipient_ids = list(dict.fromkeys(recipient_ids))
-
-    for mid in deduped_media_ids:
-        if not re.match(r"^[A-Za-z0-9_\-]{1,64}$", mid):
-            logger.warning("Rejected invalid media_id during grant: %s", mid)
-            continue
-
-        row = conn.execute(
-            "SELECT user_id FROM media WHERE id = ?",
-            (mid,),
-        ).fetchone()
-
-        if not row or row["user_id"] != uploader_id:
-            logger.warning(
-                "Unauthorized media access grant attempt (media_id=%s uploader_id=%s)",
-                mid,
-                uploader_id,
-            )
-            continue
-
-        values = [(mid, uid, now) for uid in deduped_recipient_ids]
-
-        try:
-            conn.executemany(
-                "INSERT OR IGNORE INTO media_access "
-                "(media_id, user_id, granted_at) VALUES (?,?,?)",
-                values,
-            )
-        except sqlite3.DatabaseError:
-            logger.exception(
-                "Failed granting media access during INSERT OR IGNORE into media_access "
-                "(media_id=%s recipient_count=%s granted_at=%s)",
-                mid,
-                len(deduped_recipient_ids),
-                now,
-            )
-            raise
-
-
-@app.post("/api/messages", status_code=201)
-def message_send(body: MessageIn, user = Depends(auth_dep)):
-    if body.recipientId == user["id"]:
-        raise HTTPException(400, "Cannot message yourself")
-    with db() as conn:
-        peer = conn.execute("SELECT id FROM users WHERE id = ?", (body.recipientId,)).fetchone()
-        if not peer:
-            raise HTTPException(404, "Recipient not found")
-        now = int(time.time())
-        cur = conn.execute(
-            "INSERT INTO messages (sender_id, recipient_id, ciphertext, hint, reply_to_id, created_at) VALUES (?,?,?,?,?,?)",
-            (user["id"], body.recipientId, body.ciphertext, body.hint, body.replyToId, now)
-        )
-        # Grant recipient access to any attached media files.
-        if body.mediaIds:
-            _grant_media_access(conn, body.mediaIds, user["id"], [body.recipientId])
-    _fire_push([body.recipientId], f"New message from {user['email']}", body.hint or "encrypted message")
-    return {"id": cur.lastrowid, "createdAt": now}
-
-
-@app.post("/api/messages/{msg_id}/read")
-def message_mark_read(msg_id: int, user = Depends(auth_dep)):
-    now = int(time.time())
-    with db() as conn:
-        conn.execute(
-            "UPDATE messages SET read_at = ? WHERE id = ? AND recipient_id = ? AND read_at IS NULL",
-            (now, msg_id, user["id"])
-        )
-    return {"ok": True}
-
-
-@app.delete("/api/messages/{msg_id}")
-def message_delete(msg_id: int, user = Depends(auth_dep)):
-    with db() as conn:
-        row = conn.execute(
-            "SELECT sender_id, recipient_id FROM messages WHERE id = ?", (msg_id,)
-        ).fetchone()
-        if not row:
-            raise HTTPException(404, "Not found")
-        if row["sender_id"] == user["id"]:
-            conn.execute("UPDATE messages SET deleted_by_sender = 1 WHERE id = ?", (msg_id,))
-        elif row["recipient_id"] == user["id"]:
-            conn.execute("UPDATE messages SET deleted_by_recipient = 1 WHERE id = ?", (msg_id,))
-        else:
-            raise HTTPException(403, "Not your message")
-        conn.execute(
-            "DELETE FROM messages WHERE id = ? AND deleted_by_sender = 1 AND deleted_by_recipient = 1",
-            (msg_id,)
-        )
-    return Response(status_code=204)
-
-
-@app.get("/api/messages/unread-count")
-def unread_count(user = Depends(require_user)):
-    uid = user["id"]
-    with db() as conn:
-        dm = conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE recipient_id = ? AND read_at IS NULL AND deleted_by_recipient = 0",
-            (uid,)
-        ).fetchone()[0]
-        grp = conn.execute("""
-            SELECT COALESCE(SUM(c), 0) FROM (
-              SELECT (SELECT COUNT(*) FROM group_messages
-                        WHERE group_id = gm.group_id
-                          AND created_at > gm.last_read_at
-                          AND sender_id != ?) AS c
-                FROM group_members gm
-               WHERE gm.user_id = ?
-            )
-        """, (uid, uid)).fetchone()[0]
-    return {"unread": dm + (grp or 0)}
-
-
-@app.post("/api/push-subscription", status_code=201)
-def register_push_subscription(body: PushSubscriptionIn, request: Request, user = Depends(require_user)):
-    import json
-    user_agent = request.headers.get("user-agent", "unknown")
-    now = int(time.time())
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO push_subscriptions (user_id, subscription_json, user_agent, created_at) VALUES (?,?,?,?)",
-            (user["id"], json.dumps(body.subscription), user_agent, now)
-        )
-    return {"ok": True}
-
-
-def _require_group_member(conn, group_id: int, user_id: int):
-    row = conn.execute(
-        "SELECT wrapped_key, last_read_at FROM group_members WHERE group_id = ? AND user_id = ?",
-        (group_id, user_id),
-    ).fetchone()
-    if not row:
-        raise HTTPException(403, "Not a member of this group")
-    return row
-
-
-@app.post("/api/groups", status_code=201)
-def group_create(body: GroupCreateIn, user = Depends(auth_dep)):
-    name = body.name.strip()
-    if not name:
-        raise HTTPException(400, "Name required")
-    salt_bytes = bytes.fromhex(body.salt)
-    verifier = hasher.hash(body.authHash.lower())
-    now = int(time.time())
-    with db() as conn:
-        conn.execute("BEGIN")
-        try:
-            cur = conn.execute(
-                "INSERT INTO groups (name, salt, verifier_hash, created_by, created_at) VALUES (?,?,?,?,?)",
-                (name, salt_bytes, verifier, user["id"], now)
-            )
-            gid = cur.lastrowid
-            conn.execute(
-                "INSERT INTO group_members (group_id, user_id, wrapped_key, joined_at, last_read_at) VALUES (?,?,?,?,?)",
-                (gid, user["id"], body.wrappedKey, now, now)
-            )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise HTTPException(500, "Could not create group")
-    return {"id": gid, "name": name, "salt": body.salt, "createdAt": now}
-
-
-@app.get("/api/groups")
-def groups_list(user = Depends(require_user)):
-    uid = user["id"]
-    with db() as conn:
-        rows = conn.execute("""
-            SELECT g.id, g.name, g.salt, gm.wrapped_key, gm.last_read_at,
-                   (SELECT MAX(created_at) FROM group_messages WHERE group_id = g.id) AS last_at,
-                   (SELECT COUNT(*) FROM group_messages
-                      WHERE group_id = g.id AND created_at > gm.last_read_at AND sender_id != ?) AS unread
-              FROM group_members gm
-              JOIN groups g ON g.id = gm.group_id
-             WHERE gm.user_id = ?
-             ORDER BY COALESCE(last_at, gm.joined_at) DESC
-        """, (uid, uid)).fetchall()
-    return [{
-        "id": r["id"],
-        "name": r["name"],
-        "salt": r["salt"].hex(),
-        "wrappedKey": r["wrapped_key"],
-        "lastAt": r["last_at"],
-        "unread": r["unread"],
-    } for r in rows]
-
-
-@app.get("/api/groups/{group_id}/preflight")
-def group_preflight(group_id: int, user = Depends(require_user)):
-    with db() as conn:
-        row = conn.execute("SELECT id, name, salt FROM groups WHERE id = ?", (group_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "Group not found")
-    return {"id": row["id"], "name": row["name"], "salt": row["salt"].hex()}
-
-
-@app.post("/api/groups/{group_id}/join", status_code=201)
-def group_join(group_id: int, body: GroupJoinIn, request: Request, user = Depends(auth_dep)):
-    rate_limit(f"groupjoin:{client_ip(request)}", 20, 60)
-    with db() as conn:
-        g = conn.execute("SELECT verifier_hash FROM groups WHERE id = ?", (group_id,)).fetchone()
-        if not g:
-            raise HTTPException(404, "Group not found")
-        try:
-            hasher.verify(g["verifier_hash"], body.authHash.lower())
-        except (VerifyMismatchError, InvalidHash):
-            raise HTTPException(403, "Wrong join code")
-        now = int(time.time())
-        existing = conn.execute(
-            "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?", (group_id, user["id"])
-        ).fetchone()
-        if existing:
-            conn.execute(
-                "UPDATE group_members SET wrapped_key = ? WHERE group_id = ? AND user_id = ?",
-                (body.wrappedKey, group_id, user["id"])
-            )
-        else:
-            conn.execute(
-                "INSERT INTO group_members (group_id, user_id, wrapped_key, joined_at, last_read_at) VALUES (?,?,?,?,?)",
-                (group_id, user["id"], body.wrappedKey, now, now)
-            )
-    return {"ok": True}
-
-
-@app.post("/api/groups/{group_id}/leave")
-def group_leave(group_id: int, user = Depends(auth_dep)):
-    with db() as conn:
-        _require_group_member(conn, group_id, user["id"])
-        conn.execute("DELETE FROM group_members WHERE group_id = ? AND user_id = ?", (group_id, user["id"]))
-        remaining = conn.execute("SELECT COUNT(*) FROM group_members WHERE group_id = ?", (group_id,)).fetchone()[0]
-        if remaining == 0:
-            conn.execute("DELETE FROM groups WHERE id = ?", (group_id,))
-    return Response(status_code=204)
-
-
-@app.get("/api/groups/{group_id}/messages")
-def group_messages_list(group_id: int, limit: int = 200, user = Depends(require_user)):
-    limit = max(1, min(limit, 500))
-    with db() as conn:
-        _require_group_member(conn, group_id, user["id"])
-        rows = conn.execute("""
-            SELECT id, sender_id, ciphertext, hint, reply_to_id, created_at
-              FROM group_messages
-             WHERE group_id = ?
-             ORDER BY created_at DESC
-             LIMIT ?
-        """, (group_id, limit)).fetchall()
-        senders = {r["sender_id"] for r in rows if r["sender_id"] is not None}
-        emails = {}
-        if senders:
-            qmarks = ",".join("?" * len(senders))
-            for u in conn.execute(f"SELECT id, email FROM users WHERE id IN ({qmarks})", tuple(senders)).fetchall():
-                emails[u["id"]] = u["email"]
-    return [{
-        "id": r["id"],
-        "fromMe": r["sender_id"] == user["id"],
-        "senderId": r["sender_id"],
-        "senderEmail": emails.get(r["sender_id"]),
-        "ciphertext": r["ciphertext"],
-        "hint": r["hint"],
-        "replyToId": r["reply_to_id"],
-        "createdAt": r["created_at"],
-    } for r in rows]
-
-
-@app.post("/api/groups/{group_id}/messages", status_code=201)
-def group_message_send(group_id: int, body: GroupMessageIn, user = Depends(auth_dep)):
-    with db() as conn:
-        _require_group_member(conn, group_id, user["id"])
-        now = int(time.time())
-        cur = conn.execute(
-            "INSERT INTO group_messages (group_id, sender_id, ciphertext, hint, reply_to_id, created_at) VALUES (?,?,?,?,?,?)",
-            (group_id, user["id"], body.ciphertext, body.hint, body.replyToId, now)
-        )
-        members = conn.execute(
-            "SELECT user_id FROM group_members WHERE group_id = ? AND user_id != ?",
-            (group_id, user["id"])
-        ).fetchall()
-        member_ids = [m["user_id"] for m in members]
-        # Grant all current group members access to any attached media.
-        if body.mediaIds:
-            _grant_media_access(conn, body.mediaIds, user["id"], member_ids)
-
-    _fire_push(member_ids, "New group message", body.hint or "encrypted message")
-    return {"id": cur.lastrowid, "createdAt": now}
-
-
-@app.post("/api/groups/{group_id}/read")
-def group_mark_read(group_id: int, user = Depends(auth_dep)):
-    now = int(time.time())
-    with db() as conn:
-        _require_group_member(conn, group_id, user["id"])
-        conn.execute(
-            "UPDATE group_members SET last_read_at = ? WHERE group_id = ? AND user_id = ?",
-            (now, group_id, user["id"])
-        )
-    return {"ok": True}
-
-
-@app.delete("/api/groups/{group_id}/messages/{msg_id}")
-def group_message_delete(group_id: int, msg_id: int, user = Depends(auth_dep)):
-    with db() as conn:
-        _require_group_member(conn, group_id, user["id"])
-        row = conn.execute(
-            "SELECT sender_id FROM group_messages WHERE id = ? AND group_id = ?", (msg_id, group_id)
-        ).fetchone()
-        if not row:
-            raise HTTPException(404, "Not found")
-        if row["sender_id"] != user["id"]:
-            raise HTTPException(403, "Not your message")
-        conn.execute("DELETE FROM group_messages WHERE id = ?", (msg_id,))
-    return Response(status_code=204)
-
-
-# ── Group invites ──────────────────────────────────────────────────────────────
-
-def _get_valid_invite(conn, token: str, now: int):
-    row = conn.execute(
-        """
-        SELECT gi.group_id,
-               gi.invitee_id,
-               gi.inviter_id,
-               gi.wrapped_key,
-               gi.expires_at,
-               gi.accepted_at,
-               g.name AS group_name,
-               u.email AS inviter_email
-          FROM group_invites gi
-          JOIN groups g ON g.id = gi.group_id
-          JOIN users u ON u.id = gi.inviter_id
-         WHERE gi.token = ?
-        """,
-        (token,),
-    ).fetchone()
-
-    if not row:
-        raise HTTPException(404, "Invite not found")
-
-    if row["expires_at"] < now:
-        raise HTTPException(410, "Invite has expired")
-
-    if row["accepted_at"] is not None:
-        raise HTTPException(410, "Invite has already been accepted")
-
-    return row
-
-
-
-@app.post("/api/groups/{group_id}/invite", status_code=201)
-def invite_to_group(group_id: int, body: InviteToGroupIn, request: Request, user = Depends(auth_dep)):
-    """
-    Create a time-limited invite for another registered user.
-
-    The inviter must already be a group member and must supply
-    `wrappedKeyForInvitee`: the group key wrapped for the invitee (e.g.
-    encrypted to their public key or re-derived from the group passphrase
-    on the client).  The invitee redeems the invite via POST /api/invites/{token}/accept
-    — they never need to know the group passphrase.
-    """
-    rate_limit(f"invite:{client_ip(request)}", 20, 60)
-    email = body.email.lower().strip()
-    if not EMAIL_RE.match(email):
-        raise HTTPException(400, "Invalid email")
-    now = int(time.time())
-    with db() as conn:
-        # Caller must be a member.
-        _require_group_member(conn, group_id, user["id"])
-
-        target = conn.execute(
-            "SELECT id, email FROM users WHERE email = ?", (email,)
-        ).fetchone()
-        if not target:
-            raise HTTPException(404, "No account with that email")
-        if target["id"] == user["id"]:
-            raise HTTPException(400, "Cannot invite yourself")
-
-        # Check the invitee is not already a member.
-        already = conn.execute(
-            "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?",
-            (group_id, target["id"])
-        ).fetchone()
-        if already:
-            raise HTTPException(409, "User is already a member of this group")
-
-        token = secrets.token_urlsafe(32)
-        expires_at = now + GROUP_INVITE_TTL
-        try:
-            conn.execute(
-                """INSERT INTO group_invites
-                     (token, group_id, inviter_id, invitee_id, wrapped_key, created_at, expires_at)
-                   VALUES (?,?,?,?,?,?,?)
-                   ON CONFLICT(group_id, invitee_id) DO UPDATE SET
-                     token       = excluded.token,
-                     inviter_id  = excluded.inviter_id,
-                     wrapped_key = excluded.wrapped_key,
-                     created_at  = excluded.created_at,
-                     expires_at  = excluded.expires_at,
-                     accepted_at = NULL
-                """,
-                (token, group_id, user["id"], target["id"],
-                 body.wrappedKeyForInvitee, now, expires_at)
-            )
-        except sqlite3.IntegrityError as err:
-            raise HTTPException(500, "Could not create invite") from err
-
-    # In a real deployment you would email the token to target["email"] here.
-    return {
-        "token": token,
-        "inviteeEmail": target["email"],
-        "expiresAt": expires_at,
+    masterPass = pass;
+    currentUser = result;
+    
+    document.getElementById("auth-overlay").style.display = "none";
+    document.getElementById("app").classList.remove("hidden");
+    document.getElementById("user-avatar").textContent = (currentUser.email || "?")[0].toUpperCase();
+    
+    loadVault();
+    loadHistory();
+    loadThreads();
+    toast("Logged in successfully", "success", "✓");
+  } catch (e) {
+    toast(e.message, "error", "Auth failed");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = authMode === "login" ? "Sign in" : "Create account";
+  }
+}
+
+function doLogout() {
+  // Clear all decrypted data from DOM
+  document.getElementById("vault-list").innerHTML = "";
+  document.getElementById("thread-list").innerHTML = "";
+  document.getElementById("message-list").innerHTML = "";
+  document.getElementById("history-list").innerHTML = "";
+  document.getElementById("vault-detail").innerHTML = "";
+  
+  currentUser = null;
+  masterPass = null;
+  vaultItems = [];
+  threads = [];
+  history = [];
+  currentThreadId = null;
+  currentPeerId = null;
+  currentVaultItemId = null;
+  
+  api("POST", "/api/auth/logout").catch(console.error);
+  
+  document.getElementById("auth-overlay").style.display = "flex";
+  document.getElementById("app").classList.add("hidden");
+  document.getElementById("auth-email").value = "";
+  document.getElementById("auth-pass").value = "";
+  toast("Logged out", "info");
+}
+
+function showLogout() {
+  if (confirm("Logout?")) {
+    doLogout();
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────
+   VAULT FUNCTIONS
+   ───────────────────────────────────────────────────────────── */
+async function loadVault() {
+  if (!currentUser) return;
+  try {
+    const items = await api("GET", "/api/vault");
+    vaultItems = items || [];
+    renderVault();
+  } catch (e) {
+    toast(e.message, "error", "Vault");
+  }
+}
+
+async function renderVault() {
+  const query = document.getElementById("vault-search")?.value.toLowerCase() || "";
+  const list = document.getElementById("vault-list");
+  
+  if (!vaultItems.length) {
+    list.innerHTML = '<div class="list-empty">No items in vault</div>';
+    return;
+  }
+
+  // Decrypt labels
+  const rendered = await Promise.all(vaultItems.map(async item => {
+    let label = "[encrypted]";
+    try {
+      const res = await decryptToken(item.labelCt, masterPass);
+      if (res.ok) label = res.text;
+    } catch {
+      // Use default
     }
+    return { ...item, label };
+  }));
 
+  const filtered = query
+    ? rendered.filter(i => i.label.toLowerCase().includes(query))
+    : rendered;
 
-@app.get("/api/invites/{token}")
-def invite_info(token: str, user = Depends(require_user)):
-    """
-    Return public metadata about a pending invite so the client can show a
-    confirmation screen before the invitee accepts.
-    """
-    now = int(time.time())
+  if (!filtered.length) {
+    list.innerHTML = '<div class="list-empty">No matches</div>';
+    return;
+  }
 
-    with db() as conn:
-        row = _get_valid_invite(conn, token, now)
+  list.innerHTML = filtered.map(item => `
+    <div class="list-item ${item.pinned ? "pinned" : ""}" onclick="viewVaultItem(${item.id})">
+      <div class="vault-item-label">${escHtml(item.label)}</div>
+      <div class="vault-item-meta">${item.pinned ? "📌 " : ""}${relTime(item.updatedAt)}</div>
+    </div>
+  `).join("");
+}
 
-    if user["id"] not in (row["invitee_id"], row["inviter_id"]):
-        raise HTTPException(403, "Not your invite")
+async function viewVaultItem(id) {
+  currentVaultItemId = id;
+  const item = vaultItems.find(i => i.id === id);
+  if (!item) return;
 
-    return {
-        "groupId": row["group_id"],
-        "groupName": row["group_name"],
-        "inviterEmail": row["inviter_email"],
-        "expiresAt": row["expires_at"],
+  let decrypted = "[Unable to decrypt]";
+  try {
+    const res = await decryptToken(item.payloadCt, masterPass);
+    if (res.ok) decrypted = res.text;
+  } catch (e) {
+    console.error(e);
+  }
+
+  document.querySelector(".list-item.active")?.classList.remove("active");
+  event.currentTarget?.classList.add("active");
+
+  let label = "[encrypted]";
+  try {
+    const res = await decryptToken(item.labelCt, masterPass);
+    if (res.ok) label = res.text;
+  } catch {
+    // Use default
+  }
+
+  document.getElementById("vault-detail").innerHTML = `
+    <div style="margin-bottom:20px;">
+      <h3 style="margin-bottom:8px;">${escHtml(label)}</h3>
+      <p style="color:var(--fg-dim); font-size:12px;">Updated ${relTime(item.updatedAt)}</p>
+    </div>
+    <textarea readonly style="width:100%; height:300px; padding:12px; background:var(--surface-hi); border:1px solid var(--border-soft); border-radius:8px; color:var(--fg); font-family:var(--mono); font-size:12px; resize:none;">${escHtml(decrypted)}</textarea>
+    <div style="margin-top:12px; display:flex; gap:8px;">
+      <button class="btn secondary" onclick="deleteVaultItem(${item.id})" style="flex:1;">Delete</button>
+    </div>
+  `;
+}
+
+function showNewVaultForm() {
+  document.getElementById("vault-detail").innerHTML = `
+    <h3 style="margin-bottom:16px;">New Vault Item</h3>
+    <div style="margin-bottom:12px;">
+      <label style="display:block; margin-bottom:6px; color:var(--fg-dim); font-size:12px;">Label</label>
+      <input type="text" id="vault-label" placeholder="Item name" style="width:100%; padding:10px; background:var(--surface-hi); border:1px solid var(--border-soft); border-radius:6px; color:var(--fg);">
+    </div>
+    <div style="margin-bottom:12px;">
+      <label style="display:block; margin-bottom:6px; color:var(--fg-dim); font-size:12px;">Content</label>
+      <textarea id="vault-content" placeholder="Item content" style="width:100%; height:200px; padding:10px; background:var(--surface-hi); border:1px solid var(--border-soft); border-radius:6px; color:var(--fg); resize:none;"></textarea>
+    </div>
+    <button class="btn" onclick="saveVaultItem()" style="width:100%;">Save Item</button>
+  `;
+}
+
+async function saveVaultItem() {
+  const label = document.getElementById("vault-label")?.value.trim();
+  const content = document.getElementById("vault-content")?.value.trim();
+
+  if (!label) {
+    toast("Label required", "error");
+    return;
+  }
+  if (!content) {
+    toast("Content required", "error");
+    return;
+  }
+
+  try {
+    const labelCt = await encryptText(label, masterPass);
+    const payloadCt = await encryptText(content, masterPass);
+    
+    const item = await api("POST", "/api/vault", {
+      labelCt,
+      payloadCt,
+      pinned: false
+    });
+
+    vaultItems.push(item);
+    renderVault();
+    showNewVaultForm();
+    toast("Item saved", "success", "✓");
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
+
+async function deleteVaultItem(id) {
+  if (!confirm("Delete this item?")) return;
+  try {
+    await api("DELETE", `/api/vault/${id}`);
+    vaultItems = vaultItems.filter(i => i.id !== id);
+    renderVault();
+    document.getElementById("vault-detail").innerHTML = "";
+    toast("Item deleted", "success", "✓");
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────
+   HISTORY FUNCTIONS
+   ───────────────────────────────────────────────────────────── */
+async function saveHistory(op, preview) {
+  if (!currentUser) return;
+  try {
+    // Encrypt preview
+    const previewCt = await encryptText(preview, masterPass);
+    const item = await api("POST", "/api/history", {
+      op,
+      previewCt
+    });
+    history.unshift(item);
+    if (history.length > 50) history = history.slice(0, 50);
+    renderHistory();
+  } catch (e) {
+    console.error("History save failed:", e);
+  }
+}
+
+async function loadHistory() {
+  if (!currentUser) return;
+  try {
+    history = await api("GET", "/api/history") || [];
+    renderHistory();
+  } catch (e) {
+    toast(e.message, "error", "History");
+  }
+}
+
+async function renderHistory() {
+  const list = document.getElementById("history-list");
+  if (!history.length) {
+    list.innerHTML = '<div class="list-empty">No history</div>';
+    return;
+  }
+
+  // Decrypt previews
+  const rendered = await Promise.all(history.map(async item => {
+    let preview = "[encrypted]";
+    try {
+      const res = await decryptToken(item.previewCt, masterPass);
+      if (res.ok) preview = res.text.substring(0, 100);
+    } catch {
+      // Use default
     }
+    return { ...item, preview };
+  }));
 
+  list.innerHTML = rendered.map(item => `
+    <div class="history-item">
+      <div class="history-item-type">${item.op.toUpperCase()}</div>
+      <div class="history-item-text">${escHtml(item.preview)}</div>
+      <div class="history-item-time">${relTime(item.createdAt)}</div>
+    </div>
+  `).join("");
+}
 
-@app.post("/api/invites/{token}/accept", status_code=201)
-def accept_invite(token: str, body: AcceptInviteIn, user = Depends(auth_dep)):
-    """
-    Redeem a pending group invite.
-    """
-    now = int(time.time())
+/* ─────────────────────────────────────────────────────────────
+   MESSAGING FUNCTIONS
+   ───────────────────────────────────────────────────────────── */
+async function loadThreads() {
+  if (!currentUser) return;
+  try {
+    threads = await api("GET", "/api/messages/threads") || [];
+    renderThreads();
+  } catch (e) {
+    toast(e.message, "error", "Threads");
+  }
+}
 
-    with db() as conn:
-        row = _get_valid_invite(conn, token, now)
+function renderThreads() {
+  const list = document.getElementById("thread-list");
+  if (!threads.length) {
+    list.innerHTML = '<div class="list-empty">No conversations</div>';
+    return;
+  }
+  list.innerHTML = threads.map(thread => `
+    <div class="list-item ${currentPeerId === thread.peerId ? "active" : ""}" onclick="openThread(${thread.peerId}, '${escHtml(thread.peerEmail)}')">
+      <div style="font-weight:600; font-size:13px; margin-bottom:4px;">${escHtml(thread.peerEmail)}</div>
+      <div style="font-size:11px; color:var(--fg-dim);">${thread.unread ? `${thread.unread} unread` : 'No new'}</div>
+    </div>
+  `).join("");
+}
 
-        if row["invitee_id"] != user["id"]:
-            raise HTTPException(403, "This invite is not for you")
+async function lookupUser() {
+  const email = document.getElementById("recipient-lookup").value.trim();
+  if (!email) {
+    toast("Enter an email", "error");
+    return;
+  }
+  try {
+    const user = await api("POST", "/api/messages/lookup", { email });
+    currentPeerId = user.id;
+    openThread(user.id, user.email);
+    document.getElementById("recipient-lookup").value = "";
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
 
-        group_id = row["group_id"]
-        wrapped_key = body.wrappedKey or row["wrapped_key"]
+async function openThread(peerId, peerEmail) {
+  currentPeerId = peerId;
+  document.getElementById("thread-title").textContent = peerEmail;
+  document.querySelectorAll("#thread-list .list-item").forEach(el => el.classList.remove("active"));
+  document.querySelector(`[onclick*="openThread(${peerId}"]`)?.classList.add("active");
 
-        conn.execute("BEGIN")
+  try {
+    const messages = await api("GET", `/api/messages?peer=${peerId}`);
+    renderMessages(messages || []);
+    document.getElementById("message-input").focus();
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
 
-        try:
-            existing = conn.execute(
-                "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?",
-                (group_id, user["id"]),
-            ).fetchone()
+function renderMessages(messages) {
+  const list = document.getElementById("message-list");
+  list.innerHTML = messages.reverse().map(msg => `
+    <div class="message ${msg.fromMe ? "" : "other"}">
+      <div class="message-sender">${msg.fromMe ? "You" : "Them"}</div>
+      <div class="message-text">${escHtml(msg.ciphertext.substring(0, 100))}</div>
+      <div class="message-time">${relTime(msg.createdAt)}</div>
+    </div>
+  `).join("");
+  list.scrollTop = list.scrollHeight;
+}
 
-            if existing:
-                conn.execute(
-                    "UPDATE group_members "
-                    "SET wrapped_key = ? "
-                    "WHERE group_id = ? AND user_id = ?",
-                    (wrapped_key, group_id, user["id"]),
-                )
-            else:
-                conn.execute(
-                    "INSERT INTO group_members "
-                    "(group_id, user_id, wrapped_key, joined_at, last_read_at) "
-                    "VALUES (?,?,?,?,?)",
-                    (group_id, user["id"], wrapped_key, now, now),
-                )
+async function sendMessage() {
+  if (!currentPeerId) {
+    toast("Select a conversation", "error");
+    return;
+  }
+  
+  const input = document.getElementById("message-input");
+  const text = input.value.trim();
+  if (!text) return;
 
-            conn.execute(
-                "UPDATE group_invites SET accepted_at = ? WHERE token = ?",
-                (now, token),
-            )
+  try {
+    // Encrypt the message
+    const ciphertext = await encryptText(text, masterPass);
+    
+    await api("POST", "/api/messages", {
+      recipientId: currentPeerId,
+      ciphertext,
+      hint: text.substring(0, 50)
+    });
+    input.value = "";
+    
+    // Reload messages
+    const messages = await api("GET", `/api/messages?peer=${currentPeerId}`);
+    renderMessages(messages || []);
+    
+    saveHistory("message", text);
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
 
-            conn.execute("COMMIT")
+function handleMessageKeypress(event) {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    sendMessage();
+  }
+}
 
-        except Exception:
-            conn.execute("ROLLBACK")
-            logger.exception(
-              "Failed accepting group invite for user_id=%s group_id=%s",
-               user["id"],
-               group_id,
-           )
-            raise
+function handleLookupKeypress(event) {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    lookupUser();
+  }
+}
 
-        group = conn.execute(
-            "SELECT name FROM groups WHERE id = ?",
-            (group_id,),
-        ).fetchone()
+/* ─────────────────────────────────────────────────────────────
+   CIPHER TOOL
+   ───────────────────────────────────────────────────────────── */
+async function cipherEncrypt() {
+  const key = document.getElementById("cipher-key").value;
+  const input = document.getElementById("cipher-input").value;
+  
+  if (!key || !input) {
+    toast("Enter key and text", "error");
+    return;
+  }
 
-    return {
-        "groupId": group_id,
-        "groupName": group["name"] if group else None,
+  try {
+    const output = await encryptText(input, key);
+    document.getElementById("cipher-output").value = output;
+    toast("Encrypted", "success", "✓");
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
+
+async function cipherDecrypt() {
+  const key = document.getElementById("cipher-key").value;
+  const input = document.getElementById("cipher-input").value;
+  
+  if (!key || !input) {
+    toast("Enter key and token", "error");
+    return;
+  }
+
+  try {
+    const res = await decryptToken(input, key);
+    if (!res.ok) {
+      toast(res.err || "Decryption failed", "error");
+      return;
     }
+    document.getElementById("cipher-output").value = res.text;
+    toast("Decrypted", "success", "✓");
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
 
+/* ─────────────────────────────────────────────────────────────
+   UI SWITCHING
+   ───────────────────────────────────────────────────────────── */
+function switchSidebarTab(tab) {
+  document.querySelectorAll(".tab-btn").forEach(el => el.classList.remove("active"));
+  event.currentTarget?.classList.add("active");
 
-@app.get("/api/invites")
-def list_pending_invites(user = Depends(require_user)):
-    """Return all pending (unaccepted, unexpired) invites addressed to the current user."""
-    now = int(time.time())
-    with db() as conn:
-        rows = conn.execute(
-            """SELECT gi.token, gi.group_id, g.name AS group_name,
-                      u.email AS inviter_email, gi.expires_at
-                 FROM group_invites gi
-                 JOIN groups g ON g.id = gi.group_id
-                 JOIN users  u ON u.id = gi.inviter_id
-                WHERE gi.invitee_id = ?
-                  AND gi.accepted_at IS NULL
-                  AND gi.expires_at > ?
-                ORDER BY gi.created_at DESC""",
-            (user["id"], now)
-        ).fetchall()
-    return [{
-        "token": r["token"],
-        "groupId": r["group_id"],
-        "groupName": r["group_name"],
-        "inviterEmail": r["inviter_email"],
-        "expiresAt": r["expires_at"],
-    } for r in rows]
+  document.getElementById("vault-list-panel").style.display = tab === "vault" ? "block" : "none";
+  document.getElementById("messages-list-panel").style.display = tab === "messages" ? "block" : "none";
+  document.getElementById("history-list-panel").style.display = tab === "history" ? "block" : "none";
 
+  document.getElementById("vault-panel").style.display = tab === "vault" ? "flex" : "none";
+  document.getElementById("messages-panel").classList.toggle("hidden", tab !== "messages");
+  document.getElementById("cipher-panel").classList.toggle("hidden", tab !== "cipher");
+}
 
-# ── Blocking ──────────────────────────────────────────────────────────────────
+/* ─────────────────────────────────────────────────────────────
+   EVENT LISTENERS
+   ───────────────────────────────────────────────────────────── */
+document.getElementById("auth-submit").addEventListener("click", doAuth);
+document.getElementById("auth-email").addEventListener("keypress", (e) => {
+  if (e.key === "Enter") doAuth();
+});
+document.getElementById("auth-pass").addEventListener("keypress", (e) => {
+  if (e.key === "Enter") doAuth();
+});
 
-@app.post("/api/block", status_code=201)
-def block_user(body: BlockIn, user = Depends(auth_dep)):
-    if body.userId == user["id"]:
-        raise HTTPException(400, "Cannot block yourself")
-    now = int(time.time())
-    with db() as conn:
-        target = conn.execute("SELECT id FROM users WHERE id = ?", (body.userId,)).fetchone()
-        if not target:
-            raise HTTPException(404, "User not found")
-        try:
-            conn.execute(
-                "INSERT INTO blocked_users (blocker_id, blocked_id, created_at) VALUES (?,?,?)",
-                (user["id"], body.userId, now)
-            )
-        except sqlite3.IntegrityError:
-            raise HTTPException(400, "Already blocked")
-    return {"ok": True}
-
-
-@app.delete("/api/block/{user_id}")
-def unblock_user(user_id: int, user = Depends(auth_dep)):
-    with db() as conn:
-        conn.execute(
-            "DELETE FROM blocked_users WHERE blocker_id = ? AND blocked_id = ?",
-            (user["id"], user_id)
-        )
-    return Response(status_code=204)
-
-
-@app.get("/api/blocks")
-def list_blocked(user = Depends(auth_dep)):
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT u.id, u.email, b.created_at FROM blocked_users b "
-            "JOIN users u ON b.blocked_id = u.id WHERE b.blocker_id = ? "
-            "ORDER BY b.created_at DESC",
-            (user["id"],)
-        ).fetchall()
-    return [{"id": r["id"], "email": r["email"], "blockedAt": r["created_at"]} for r in rows]
-
-
-# ── Reports ───────────────────────────────────────────────────────────────────
-
-@app.post("/api/report", status_code=201)
-def report(body: ReportIn, user = Depends(auth_dep)):
-    if not body.reportedUserId and not body.messageId and not body.groupMessageId:
-        raise HTTPException(400, "Must report a user or message")
-    now = int(time.time())
-    with db() as conn:
-        cur = conn.execute(
-            "INSERT INTO reports (reporter_id, reported_user_id, message_id, group_message_id, reason, details, created_at) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (user["id"], body.reportedUserId, body.messageId, body.groupMessageId, body.reason, body.details, now)
-        )
-    return {"id": cur.lastrowid}
-
-
-# ── Session management ────────────────────────────────────────────────────────
-
-@app.post("/api/auth/logout-all")
-def logout_all(body: DeleteAccountIn, user = Depends(auth_dep)):
-    """Logout all other sessions, require password (auth_hash) verification"""
-    try:
-        hasher.verify(user["auth_hash"], body.authHash.lower())
-    except (VerifyMismatchError, InvalidHash):
-        raise HTTPException(401, "Wrong password")
-    with db() as conn:
-        conn.execute(
-            "DELETE FROM sessions WHERE user_id = ? AND id != ?",
-            (user["id"], user["sess_id"])
-        )
-    return {"ok": True}
-
-
-# ── Login tracking ────────────────────────────────────────────────────────────
-
-def _log_login(user_id: int, request: Request):
-    """Track login history for sign-in notifications"""
-    try:
-        ip = client_ip(request)
-        ua = request.headers.get("user-agent", "unknown")[:500]
-        now = int(time.time())
-        with db() as conn:
-            conn.execute(
-                "INSERT INTO login_history (user_id, ip, user_agent, created_at) VALUES (?,?,?,?)",
-                (user_id, ip, ua, now)
-            )
-    except Exception as e:
-        print(f"[login_history] error: {e}")
-
-
-@app.get("/api/auth/logins")
-def get_logins(user = Depends(require_user)):
-    """List recent logins"""
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT ip, user_agent, created_at FROM login_history WHERE user_id = ? "
-            "ORDER BY created_at DESC LIMIT 50",
-            (user["id"],)
-        ).fetchall()
-    return [{
-        "ip": r["ip"],
-        "userAgent": r["user_agent"],
-        "createdAt": r["created_at"]
-    } for r in rows]
-
-
-# ── Media uploads (zero-knowledge: ciphertext only) ───────────────────────────
-
-@app.post("/api/media", status_code=201)
-async def media_upload(request: Request, user = Depends(auth_dep)):
-    """Accept encrypted media blob and store it. Returns media_id for the recipient."""
-    content_length = int(request.headers.get("content-length", 0))
-    if content_length > 50 * 1024 * 1024:  # 50MB max
-        raise HTTPException(413, "File too large (max 50MB)")
-    body = await request.body()
-    if len(body) == 0:
-        raise HTTPException(400, "Empty body")
-    media_dir = DB_PATH.parent / "media"
-    media_dir.mkdir(parents=True, exist_ok=True)
-    media_id = secrets.token_urlsafe(24)
-    now = int(time.time())
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO media (id, user_id, size_bytes, created_at) VALUES (?,?,?,?)",
-            (media_id, user["id"], len(body), now)
-        )
-        # The uploader always has access to their own file.
-        conn.execute(
-            "INSERT OR IGNORE INTO media_access (media_id, user_id, granted_at) VALUES (?,?,?)",
-            (media_id, user["id"], now)
-        )
-    (media_dir / media_id).write_bytes(body)
-    return {"mediaId": media_id, "size": len(body)}
-
-
-@app.get("/api/media/{media_id}")
-def media_get(media_id: str, user = Depends(require_user)):
-    """
-    Return the raw encrypted blob.
-
-    Access is restricted to:
-      - the original uploader, and
-      - any user explicitly granted access (i.e. a message recipient or group
-        member whose message included this media_id).
-    """
-    if not re.match(r"^[A-Za-z0-9_\-]{1,64}$", media_id):
-        raise HTTPException(400, "Invalid media id")
-    with db() as conn:
-        access = conn.execute(
-            "SELECT 1 FROM media_access WHERE media_id = ? AND user_id = ?",
-            (media_id, user["id"])
-        ).fetchone()
-    if not access:
-        raise HTTPException(403, "Access denied")
-    media_dir = DB_PATH.parent / "media"
-    path = media_dir / media_id
-    if not path.is_file():
-        raise HTTPException(404, "Not found")
-    return FileResponse(path, media_type="application/octet-stream",
-                        headers={"Cache-Control": "no-store"})
-
-
-@app.get("/api/health")
-def health():
-    return {"ok": True, "time": int(time.time())}
-
-
-if STATIC_DIR.exists():
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-    @app.get("/")
-    def index_root():
-        return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
-
-    @app.get("/standalone")
-    def standalone():
-        f = STATIC_DIR / "cipher.html"
-        if not f.is_file():
-            raise HTTPException(404)
-        return FileResponse(f)
+setAuthMode("login");
+</script>
+</body>
+</html>
