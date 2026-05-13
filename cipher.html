@@ -375,7 +375,7 @@
   }
 
   /* ── Util ── */
-  .hidden { display: none !important; }
+  .hidden { display: none; }
   .loading { opacity: 0.5; pointer-events: none; }
   .spin { animation: spin 0.8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -560,7 +560,7 @@
   </div><!-- /panel-cipher -->
 
   <!-- ═══ VAULT PANEL ═══ -->
-  <div class="panel hidden" id="panel-vault">
+  <div class="panel" id="panel-vault">
     <section class="card">
       <div class="card-label"><span>Encrypted Vault</span><span class="hint">Items decrypted locally in browser</span></div>
       <div class="vault-toolbar">
@@ -581,7 +581,7 @@
   </div>
 
   <!-- ═══ MESSAGES PANEL ═══ -->
-  <div class="panel hidden" id="panel-messages">
+  <div class="panel" id="panel-messages">
     <div class="msg-layout">
       <div class="msg-sidebar">
         <div class="msg-sidebar-header">
@@ -616,7 +616,7 @@
   </div>
 
   <!-- ═══ HISTORY PANEL ═══ -->
-  <div class="panel hidden" id="panel-history">
+  <div class="panel" id="panel-history">
     <section class="card">
       <div class="card-label">
         <span>Operation History</span>
