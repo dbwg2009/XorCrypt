@@ -90,6 +90,7 @@ const state = {
   threadKeyCache: {},   // peerId → vault item used last to decrypt (DM only)
   replyingTo: null,     // {id, preview} if replying to a message
   pendingMedia: null,   // {id, keyHex, name, type, size} attached to next message
+  messagesDecrypted: false, // whether messages in current thread are decrypted
   route: "cipher",
   cipherMode: "encrypt",
   showKey: false,
@@ -1042,10 +1043,20 @@ async function openDmThread(peerId) {
       <div class="h-meta">direct · end-to-end · key never leaves your browser</div>
     </div>
     <div style="display:flex;gap:6px;">
+      <button class="icon-btn" id="msg-decrypt-all" type="button">decrypt all</button>
+      <button class="icon-btn" id="msg-encrypt-all" type="button">encrypt all</button>
       <button class="icon-btn" id="msg-refresh" type="button">refresh</button>
       <button class="icon-btn" id="msg-block" type="button">block</button>
     </div>
   `;
+  $("msg-decrypt-all").addEventListener("click", () => {
+    state.messagesDecrypted = true;
+    renderDmMessages();
+  });
+  $("msg-encrypt-all").addEventListener("click", () => {
+    state.messagesDecrypted = false;
+    renderDmMessages();
+  });
   $("msg-refresh").addEventListener("click", () => loadDmMessages(peerId));
   $("msg-block").addEventListener("click", async () => {
     const ok = await confirmDialog({
@@ -1084,11 +1095,21 @@ async function openGroupThread(groupId) {
       <div class="h-meta">group · encrypted with shared join code</div>
     </div>
     <div style="display:flex;gap:6px;">
+      <button class="icon-btn" id="msg-decrypt-all" type="button">decrypt all</button>
+      <button class="icon-btn" id="msg-encrypt-all" type="button">encrypt all</button>
       <button class="icon-btn" id="msg-refresh" type="button">refresh</button>
       <button class="icon-btn" id="msg-share-code" type="button">share code</button>
       <button class="icon-btn" id="msg-leave-group" type="button">leave</button>
     </div>
   `;
+  $("msg-decrypt-all").addEventListener("click", () => {
+    state.messagesDecrypted = true;
+    renderGroupMessages();
+  });
+  $("msg-encrypt-all").addEventListener("click", () => {
+    state.messagesDecrypted = false;
+    renderGroupMessages();
+  });
   $("msg-refresh").addEventListener("click", () => loadGroupMessages(groupId));
   $("msg-share-code").addEventListener("click", async () => {
     if (!g.passcode) {
@@ -1128,6 +1149,8 @@ async function openGroupThread(groupId) {
 async function loadDmMessages(peerId) {
   try {
     state.messages = await api.get(`/api/messages?peer=${peerId}&limit=200`);
+    // Reset decryption state for new thread
+    state.messagesDecrypted = false;
     await renderDmMessages();
     for (const m of state.messages) {
       if (!m.fromMe && !m.readAt) {
@@ -1145,6 +1168,8 @@ async function loadDmMessages(peerId) {
 async function loadGroupMessages(groupId) {
   try {
     state.messages = await api.get(`/api/groups/${groupId}/messages?limit=200`);
+    // Reset decryption state for new thread
+    state.messagesDecrypted = false;
     await renderGroupMessages();
     try { await api.post(`/api/groups/${groupId}/read`); } catch {}
     const g = state.groups.find(x => x.id === groupId);
@@ -1227,14 +1252,15 @@ async function loadMediaInto(el) {
 }
 
 function renderBubble(m, decrypted, side, opts = {}) {
-  const meta = decrypted.ok
+  const isDecrypted = state.messagesDecrypted;
+  const meta = isDecrypted && decrypted.ok
     ? `<span>${escapeHtml(opts.label || decrypted.keyLabel || "key")}</span><span>·</span><span>${fmtTime(m.createdAt)}</span>`
-    : `<span>can't decrypt</span><span>·</span><span>${fmtTime(m.createdAt)}</span>`;
+    : `<span>encrypted</span><span>·</span><span>${fmtTime(m.createdAt)}</span>`;
   const sender = opts.sender ? `<div class="b-hint">${escapeHtml(opts.sender)}</div>` : "";
   const hint = m.hint ? `<div class="b-hint">hint: ${escapeHtml(m.hint)}</div>` : "";
 
   let bodyHtml = "";
-  if (decrypted.ok) {
+  if (isDecrypted && decrypted.ok) {
     const parsed = parseMessagePayload(decrypted.text);
     if (parsed.text) bodyHtml += `<div>${escapeHtml(parsed.text)}</div>`;
     for (const med of parsed.media) {
@@ -1245,7 +1271,7 @@ function renderBubble(m, decrypted, side, opts = {}) {
   }
   const replyIndicator = m.replyToId ? `<div class="b-reply-indicator">↳ reply to message</div>` : "";
   return `
-    <div class="msg-bubble ${side} ${decrypted.ok ? "" : "encrypted"}" data-id="${m.id}" data-reply-to="${m.replyToId || ""}" data-sender="${opts.senderId || ""}">
+    <div class="msg-bubble ${side} ${isDecrypted && decrypted.ok ? "" : "encrypted"}" data-id="${m.id}" data-reply-to="${m.replyToId || ""}" data-sender="${opts.senderId || ""}">
       ${sender}${replyIndicator}${hint}${bodyHtml}
       <div class="b-meta">${meta}</div>
       <div class="b-actions">
