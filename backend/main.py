@@ -417,6 +417,18 @@ class GroupMessageIn(BaseMessageIn):
     pass
 
 
+class GroupCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    salt: str = Field(pattern="^[0-9a-fA-F]{32}$")
+    authHash: str = Field(pattern="^[0-9a-fA-F]{64}$")
+    wrappedKey: str = Field(min_length=1, max_length=4096)
+
+
+class GroupJoinIn(BaseModel):
+    authHash: str = Field(pattern="^[0-9a-fA-F]{64}$")
+    wrappedKey: str = Field(min_length=1, max_length=4096)
+
+
 class PushSubscriptionIn(BaseModel):
     subscription: dict
 
