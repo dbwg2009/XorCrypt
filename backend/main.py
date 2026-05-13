@@ -417,6 +417,18 @@ class GroupMessageIn(BaseMessageIn):
     pass
 
 
+class GroupCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    salt: str = Field(pattern="^[0-9a-fA-F]{32}$")
+    authHash: str = Field(pattern="^[0-9a-fA-F]{64}$")
+    wrappedKey: str = Field(min_length=1, max_length=4096)
+
+
+class GroupJoinIn(BaseModel):
+    authHash: str = Field(pattern="^[0-9a-fA-F]{64}$")
+    wrappedKey: str = Field(min_length=1, max_length=4096)
+
+
 class PushSubscriptionIn(BaseModel):
     subscription: dict
 
@@ -444,6 +456,10 @@ class AcceptInviteIn(BaseModel):
     # The invitee may optionally re-wrap the key (e.g. to a different local
     # key format); if omitted the server uses the key the inviter stored.
     wrappedKey: Optional[str] = Field(default=None, min_length=1, max_length=4096)
+
+
+class LookupIn(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
 
 
 app = FastAPI(title="ASCII Cipher Vault", openapi_url=None, docs_url=None, redoc_url=None)
