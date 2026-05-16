@@ -747,7 +747,7 @@ async function loadModeration() {
 
     const reports = await api.get("/api/mod/reports?limit=100");
   const reportsList = $("mod-reports-list");
-  reportsList.innerHTML = "";
+  reportsList.replaceChildren();
   if (reports.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty";
@@ -788,7 +788,7 @@ async function loadModeration() {
 
   const users = await api.get("/api/mod/users?limit=200");
   const usersList = $("mod-users-list");
-  usersList.innerHTML = "";
+  usersList.replaceChildren();
   if (users.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty";
@@ -876,8 +876,16 @@ async function loadModeration() {
 } catch (e) {
   const reportsList = $("mod-reports-list");
   const usersList = $("mod-users-list");
-  reportsList.innerHTML = `<p class="form-error">${escapeHtml(e.message)}</p>`;
-  usersList.innerHTML = `<p class="form-error">${escapeHtml(e.message)}</p>`;
+  
+  const errorEl1 = document.createElement("p");
+  errorEl1.className = "form-error";
+  errorEl1.textContent = e.message;
+  reportsList.replaceChildren(errorEl1);
+  
+  const errorEl2 = document.createElement("p");
+  errorEl2.className = "form-error";
+  errorEl2.textContent = e.message;
+  usersList.replaceChildren(errorEl2);
 }
 
 async function loadSessions() {
