@@ -1125,7 +1125,7 @@ def group_leave(group_id: int, user = Depends(require_active_user)):
 
 
 @app.get("/api/groups/{group_id}/messages")
-def group_messages_list(group_id: int, limit: int = 200, user = Depends(require_user)):
+def group_messages_list(group_id: int, limit: int = 200, user = Depends(require_active_user)):
     limit = max(1, min(limit, 500))
     with db() as conn:
         _require_group_member(conn, group_id, user["id"])

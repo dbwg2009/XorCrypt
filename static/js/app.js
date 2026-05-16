@@ -865,7 +865,8 @@ async function loadModeration() {
           const ok = await confirmDialog({ title: confirmText, body: "This change affects sign-in and messaging rights.", okText: action === "restore" ? "Restore" : action === "ban" ? "Ban" : "Suspend", danger: action !== "restore" });
           if (!ok) return;
           await api.post(`/api/mod/users/${userId}/status`, { action });
-          toast(`Account ${action}ed`, "info");
+          const actionLabel = { suspend: "suspended", ban: "banned", restore: "restored" }[action];
+          toast(`Account ${actionLabel}`, "info");
           loadModeration();
         } catch (e) {
           toast(`Error: ${e.message}`, "error");
