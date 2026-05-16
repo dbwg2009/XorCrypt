@@ -1144,7 +1144,7 @@ async function openDmThread(peerId) {
   refreshMsgKeySource();
   renderThreads();
   renderGroups();
-  await loadDmMessages(peerId);
+  await loadDmMessages(peerId, true);
   setTimeout(() => msgEls.body.focus(), 50);
 }
 
@@ -1206,15 +1206,14 @@ async function openGroupThread(groupId) {
   msgEls.keyRow.classList.add("hidden"); // group key is fixed
   renderThreads();
   renderGroups();
-  await loadGroupMessages(groupId);
+  await loadGroupMessages(groupId, true);
   setTimeout(() => msgEls.body.focus(), 50);
 }
 
-async function loadDmMessages(peerId) {
+async function loadDmMessages(peerId, resetDecryption = false) {
   try {
     state.messages = await api.get(`/api/messages?peer=${peerId}&limit=200`);
-    // Reset decryption state for new thread
-    state.messagesDecrypted = false;
+    if (resetDecryption) state.messagesDecrypted = false;
     await renderDmMessages();
     for (const m of state.messages) {
       if (!m.fromMe && !m.readAt) {
@@ -1229,11 +1228,10 @@ async function loadDmMessages(peerId) {
   }
 }
 
-async function loadGroupMessages(groupId) {
+async function loadGroupMessages(groupId, resetDecryption = false) {
   try {
     state.messages = await api.get(`/api/groups/${groupId}/messages?limit=200`);
-    // Reset decryption state for new thread
-    state.messagesDecrypted = false;
+    if (resetDecryption) state.messagesDecrypted = false;
     await renderGroupMessages();
     try { await api.post(`/api/groups/${groupId}/read`); } catch {}
     const g = state.groups.find(x => x.id === groupId);

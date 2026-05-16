@@ -334,9 +334,9 @@ def make_session(user_id: int, request: Request, response: Response):
 
 
 def is_moderator_row(user: sqlite3.Row) -> bool:
-    if user.get("role") == "moderator":
+    if user["role"] == "moderator":
         return True
-    return user.get("email", "").lower() in MODERATOR_EMAILS
+    return user["email"].lower() in MODERATOR_EMAILS
 
 
 def current_user(request: Request) -> Optional[sqlite3.Row]:
@@ -477,7 +477,7 @@ class ReportIn(BaseModel):
 
 
 class ModUserActionIn(BaseModel):
-    action: str = Field(..., regex="^(suspend|ban|restore)$")
+    action: str = Field(..., pattern="^(suspend|ban|restore)$")
 
 
 class InviteToGroupIn(BaseModel):
