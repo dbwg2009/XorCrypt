@@ -736,59 +736,148 @@ async function loadSettings() {
 }
 
 async function loadModeration() {
-  const stats = await api.get("/api/mod/stats");
-  $("mod-total-users").textContent = stats.totalUsers;
-  $("mod-active-users").textContent = stats.activeUsers;
-  $("mod-suspended-users").textContent = stats.suspendedUsers;
-  $("mod-banned-users").textContent = stats.bannedUsers;
-  $("mod-total-messages").textContent = stats.totalMessages;
-  $("mod-total-reports").textContent = stats.totalReports;
+  try {
+    const stats = await api.get("/api/mod/stats");
+    $("mod-total-users").textContent = stats.totalUsers;
+    $("mod-active-users").textContent = stats.activeUsers;
+    $("mod-suspended-users").textContent = stats.suspendedUsers;
+    $("mod-banned-users").textContent = stats.bannedUsers;
+    $("mod-total-messages").textContent = stats.totalMessages;
+    $("mod-total-reports").textContent = stats.totalReports;
 
-  const reports = await api.get("/api/mod/reports?limit=100");
+    const reports = await api.get("/api/mod/reports?limit=100");
   const reportsList = $("mod-reports-list");
+  reportsList.innerHTML = "";
   if (reports.length === 0) {
-    reportsList.innerHTML = `<div class="empty"><p>No recent reports.</p></div>`;
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    const p = document.createElement("p");
+    p.textContent = "No recent reports.";
+    empty.appendChild(p);
+    reportsList.appendChild(empty);
   } else {
-    reportsList.innerHTML = reports.map(r => `
-      <div class="report-row" style="padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.08);">
-        <div><b>${escapeHtml(r.reason)}</b> · ${fmtTime(r.createdAt)}</div>
-        <div class="muted small">Reporter: ${escapeHtml(r.reporterEmail || "unknown")} · Reported: ${escapeHtml(r.reportedUserEmail || "unknown")}</div>
-        <div>${escapeHtml(r.details || "No additional details.")}</div>
-        <div class="muted small">DM ${r.messageId ? `id ${r.messageId}` : r.groupMessageId ? `group id ${r.groupMessageId}` : "user report"}</div>
-      </div>
-    `).join("");
+    reports.forEach(r => {
+      const reportRow = document.createElement("div");
+      reportRow.className = "report-row";
+      reportRow.style.cssText = "padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.08);";
+      
+      const line1 = document.createElement("div");
+      const reasonB = document.createElement("b");
+      reasonB.textContent = r.reason;
+      line1.appendChild(reasonB);
+      line1.appendChild(document.createTextNode(" · " + fmtTime(r.createdAt)));
+      reportRow.appendChild(line1);
+      
+      const line2 = document.createElement("div");
+      line2.className = "muted small";
+      line2.textContent = "Reporter: " + (r.reporterEmail || "unknown") + " · Reported: " + (r.reportedUserEmail || "unknown");
+      reportRow.appendChild(line2);
+      
+      const line3 = document.createElement("div");
+      line3.textContent = r.details || "No additional details.";
+      reportRow.appendChild(line3);
+      
+      const line4 = document.createElement("div");
+      line4.className = "muted small";
+      line4.textContent = "DM " + (r.messageId ? "id " + r.messageId : r.groupMessageId ? "group id " + r.groupMessageId : "user report");
+      reportRow.appendChild(line4);
+      
+      reportsList.appendChild(reportRow);
+    });
   }
 
   const users = await api.get("/api/mod/users?limit=200");
   const usersList = $("mod-users-list");
+  usersList.innerHTML = "";
   if (users.length === 0) {
-    usersList.innerHTML = `<div class="empty"><p>No user accounts.</p></div>`;
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    const p = document.createElement("p");
+    p.textContent = "No user accounts.";
+    empty.appendChild(p);
+    usersList.appendChild(empty);
   } else {
-    usersList.innerHTML = users.map(u => `
-      <div class="session-item" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
-        <div style="min-width:0;">
-          <div><b>${escapeHtml(u.email)}</b> ${u.role === "moderator" ? `<span class="hint">(moderator)</span>` : ""}</div>
-          <div class="muted small">Status: ${escapeHtml(u.status)} · Created ${fmtTime(u.createdAt)} · Last login ${fmtTime(u.lastLoginAt)}</div>
-        </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          ${u.status !== "suspended" && u.status !== "banned" ? `<button class="btn ghost" data-mod-action="suspend" data-user-id="${u.id}">Suspend</button><button class="btn ghost" data-mod-action="ban" data-user-id="${u.id}">Ban</button>` : ""}
-          ${u.status !== "active" ? `<button class="btn primary" data-mod-action="restore" data-user-id="${u.id}">Restore</button>` : ""}
-        </div>
-      </div>
-    `).join("");
+    users.forEach(u => {
+      const sessionItem = document.createElement("div");
+      sessionItem.className = "session-item";
+      sessionItem.style.cssText = "display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;";
+      
+      const leftDiv = document.createElement("div");
+      leftDiv.style.cssText = "min-width:0;";
+      
+      const emailDiv = document.createElement("div");
+      const emailB = document.createElement("b");
+      emailB.textContent = u.email;
+      emailDiv.appendChild(emailB);
+      if (u.role === "moderator") {
+        const hint = document.createElement("span");
+        hint.className = "hint";
+        hint.textContent = "(moderator)";
+        emailDiv.appendChild(document.createTextNode(" "));
+        emailDiv.appendChild(hint);
+      }
+      leftDiv.appendChild(emailDiv);
+      
+      const statusDiv = document.createElement("div");
+      statusDiv.className = "muted small";
+      statusDiv.textContent = "Status: " + u.status + " · Created " + fmtTime(u.createdAt) + " · Last login " + fmtTime(u.lastLoginAt);
+      leftDiv.appendChild(statusDiv);
+      
+      sessionItem.appendChild(leftDiv);
+      
+      const rightDiv = document.createElement("div");
+      rightDiv.style.cssText = "display:flex;gap:8px;flex-wrap:wrap;";
+      
+      if (u.status !== "suspended" && u.status !== "banned") {
+        const suspendBtn = document.createElement("button");
+        suspendBtn.className = "btn ghost";
+        suspendBtn.setAttribute("data-mod-action", "suspend");
+        suspendBtn.setAttribute("data-user-id", u.id);
+        suspendBtn.textContent = "Suspend";
+        rightDiv.appendChild(suspendBtn);
+        
+        const banBtn = document.createElement("button");
+        banBtn.className = "btn ghost";
+        banBtn.setAttribute("data-mod-action", "ban");
+        banBtn.setAttribute("data-user-id", u.id);
+        banBtn.textContent = "Ban";
+        rightDiv.appendChild(banBtn);
+      }
+      
+      if (u.status !== "active") {
+        const restoreBtn = document.createElement("button");
+        restoreBtn.className = "btn primary";
+        restoreBtn.setAttribute("data-mod-action", "restore");
+        restoreBtn.setAttribute("data-user-id", u.id);
+        restoreBtn.textContent = "Restore";
+        rightDiv.appendChild(restoreBtn);
+      }
+      
+      sessionItem.appendChild(rightDiv);
+      usersList.appendChild(sessionItem);
+    });
     for (const btn of usersList.querySelectorAll("[data-mod-action]")) {
       btn.addEventListener("click", async () => {
-        const action = btn.dataset.modAction;
-        const userId = Number(btn.dataset.userId);
-        const confirmText = action === "ban" ? "Ban this account?" : action === "suspend" ? "Suspend this account?" : "Restore this account?";
-        const ok = await confirmDialog({ title: confirmText, body: "This change affects sign-in and messaging rights.", okText: action === "restore" ? "Restore" : action === "ban" ? "Ban" : "Suspend", danger: action !== "restore" });
-        if (!ok) return;
-        await api.post(`/api/mod/users/${userId}/status`, { action });
-        toast(`Account ${action}ed`, "info");
-        loadModeration();
+        try {
+          const action = btn.dataset.modAction;
+          const userId = Number(btn.dataset.userId);
+          const confirmText = action === "ban" ? "Ban this account?" : action === "suspend" ? "Suspend this account?" : "Restore this account?";
+          const ok = await confirmDialog({ title: confirmText, body: "This change affects sign-in and messaging rights.", okText: action === "restore" ? "Restore" : action === "ban" ? "Ban" : "Suspend", danger: action !== "restore" });
+          if (!ok) return;
+          await api.post(`/api/mod/users/${userId}/status`, { action });
+          toast(`Account ${action}ed`, "info");
+          loadModeration();
+        } catch (e) {
+          toast(`Error: ${e.message}`, "error");
+        }
       });
     }
   }
+} catch (e) {
+  const reportsList = $("mod-reports-list");
+  const usersList = $("mod-users-list");
+  reportsList.innerHTML = `<p class="form-error">${escapeHtml(e.message)}</p>`;
+  usersList.innerHTML = `<p class="form-error">${escapeHtml(e.message)}</p>`;
 }
 
 async function loadSessions() {
