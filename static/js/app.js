@@ -1976,6 +1976,7 @@ async function boot() {
     state.user = await api.get("/api/auth/me");
     $("user-email").textContent = state.user.email;
     $("unlock-email").textContent = state.user.email;
+    updateModeratorTab();
     setView("unlock");
     setTimeout(() => $("unlock-password").focus(), 60);
   } catch (err) {

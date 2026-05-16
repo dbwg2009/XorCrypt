@@ -383,15 +383,16 @@ def auth_dep(request: Request):
     return user
 
 
-def require_moderator(user = Depends(require_user)):
-    if not is_moderator_row(user):
-        raise HTTPException(403, "Moderator access required")
+def require_active_user(request: Request, user = Depends(require_user)):
+    require_csrf(request, user)
+    if user["status"] != "active":
+        raise HTTPException(403, "Account suspended")
     return user
 
 
-def require_active_user(user = Depends(require_user)):
-    if user["status"] != "active":
-        raise HTTPException(403, "Account suspended")
+def require_moderator(user = Depends(require_active_user)):
+    if not is_moderator_row(user):
+        raise HTTPException(403, "Moderator access required")
     return user
 
 
@@ -1555,11 +1556,14 @@ def mod_user_status(user_id: int, body: ModUserActionIn, user = Depends(require_
     else:
         status = "active"
     with db() as conn:
-        target = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+        target = conn.execute("SELECT id, email FROM users WHERE id = ?", (user_id,)).fetchone()
         if not target:
             raise HTTPException(404, "User not found")
+        # Prevent moderators from modifying other moderators
+        if status != "active" and target["email"].lower() in MODERATOR_EMAILS:
+            raise HTTPException(403, "Cannot modify moderator accounts")
         conn.execute("UPDATE users SET status = ? WHERE id = ?", (status, user_id))
-        if status == "banned":
+        if status in ("banned", "suspended"):
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
     return {"ok": True}
 
