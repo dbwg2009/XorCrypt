@@ -40,6 +40,14 @@ CSRF_HEADER = "X-CSRF-Token"
 PBKDF2_ITERATIONS = 200_000
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
+MODERATOR_EMAILS = {
+    email.strip().lower()
+    for email in os.environ.get("CIPHER_MODERATOR_EMAILS", "").split(",")
+    if email.strip()
+}
+
+START_TIME = int(time.time())
+
 # Group invite tokens expire after 7 days
 GROUP_INVITE_TTL = 7 * 24 * 60 * 60
 
@@ -56,6 +64,8 @@ CREATE TABLE IF NOT EXISTS users (
   email TEXT UNIQUE NOT NULL,
   auth_salt BLOB NOT NULL,
   auth_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'user',
+  status TEXT NOT NULL DEFAULT 'active',
   created_at INTEGER NOT NULL,
   last_login_at INTEGER
 );
@@ -230,6 +240,8 @@ CREATE INDEX IF NOT EXISTS idx_group_invites_group   ON group_invites(group_id);
 def _migrate(conn):
     """Apply additive column migrations safely."""
     migrations = [
+        ("users",          "role", "TEXT NOT NULL DEFAULT 'user'"),
+        ("users",          "status", "TEXT NOT NULL DEFAULT 'active'"),
         ("messages",       "reply_to_id", "INTEGER REFERENCES messages(id) ON DELETE SET NULL"),
         ("group_messages", "reply_to_id", "INTEGER REFERENCES group_messages(id) ON DELETE SET NULL"),
         ("push_subscriptions", None, None),  # table-level check only
@@ -321,19 +333,26 @@ def make_session(user_id: int, request: Request, response: Response):
     set_cookie(response, CSRF_COOKIE, csrf, request, http_only=False)
 
 
+def is_moderator_row(user: sqlite3.Row) -> bool:
+    if user.get("role") == "moderator":
+        return True
+    return user.get("email", "").lower() in MODERATOR_EMAILS
+
+
 def current_user(request: Request) -> Optional[sqlite3.Row]:
     sid = request.cookies.get(SESSION_COOKIE)
     if not sid:
         return None
     with db() as conn:
         row = conn.execute(
-            """SELECT u.id, u.email, u.auth_salt, u.auth_hash, u.created_at, u.last_login_at,
+            """SELECT u.id, u.email, u.auth_salt, u.auth_hash, u.role, u.status,
+                      u.created_at, u.last_login_at,
                       s.id AS sess_id, s.csrf AS sess_csrf, s.expires_at AS sess_exp
                  FROM sessions s JOIN users u ON u.id = s.user_id
                 WHERE s.id = ?""",
             (sid,)
         ).fetchone()
-    if not row or row["sess_exp"] < int(time.time()):
+    if not row or row["sess_exp"] < int(time.time()) or row["status"] == "banned":
         return None
     return row
 
@@ -361,6 +380,18 @@ def require_csrf(request: Request, user):
 def auth_dep(request: Request):
     user = require_user(request)
     require_csrf(request, user)
+    return user
+
+
+def require_moderator(user = Depends(require_user)):
+    if not is_moderator_row(user):
+        raise HTTPException(403, "Moderator access required")
+    return user
+
+
+def require_active_user(user = Depends(require_user)):
+    if user["status"] != "active":
+        raise HTTPException(403, "Account suspended")
     return user
 
 
@@ -445,6 +476,10 @@ class ReportIn(BaseModel):
     details: Optional[str] = Field(default=None, max_length=2000)
 
 
+class ModUserActionIn(BaseModel):
+    action: str = Field(..., regex="^(suspend|ban|restore)$")
+
+
 class InviteToGroupIn(BaseModel):
     email: str = Field(min_length=3, max_length=254)
     # The inviter must pre-wrap the group key for the invitee's public key
@@ -518,11 +553,12 @@ def register(body: RegisterIn, request: Request, response: Response):
     salt_bytes = bytes.fromhex(body.authSalt)
     auth_hash_stored = hasher.hash(body.authHash.lower())
     now = int(time.time())
+    role = "moderator" if email in MODERATOR_EMAILS else "user"
     with db() as conn:
         try:
             cur = conn.execute(
-                "INSERT INTO users (email, auth_salt, auth_hash, created_at, last_login_at) VALUES (?,?,?,?,?)",
-                (email, salt_bytes, auth_hash_stored, now, now)
+                "INSERT INTO users (email, auth_salt, auth_hash, role, status, created_at, last_login_at) VALUES (?,?,?,?,?,?,?)",
+                (email, salt_bytes, auth_hash_stored, role, "active", now, now)
             )
         except sqlite3.IntegrityError:
             raise HTTPException(409, "Email already registered")
@@ -536,9 +572,11 @@ def login(body: LoginIn, request: Request, response: Response):
     rate_limit(f"login:{client_ip(request)}", 10, 60)
     email = body.email.lower().strip()
     with db() as conn:
-        row = conn.execute("SELECT id, auth_hash FROM users WHERE email = ?", (email,)).fetchone()
+        row = conn.execute("SELECT id, auth_hash, status FROM users WHERE email = ?", (email,)).fetchone()
     if not row:
         raise HTTPException(401, "Invalid credentials")
+    if row["status"] == "banned":
+        raise HTTPException(403, "Account banned")
     try:
         hasher.verify(row["auth_hash"], body.authHash.lower())
     except (VerifyMismatchError, InvalidHash):
@@ -581,6 +619,9 @@ def me(user = Depends(require_user)):
         "createdAt": user["created_at"],
         "lastLoginAt": user["last_login_at"],
         "iterations": PBKDF2_ITERATIONS,
+        "role": user["role"],
+        "status": user["status"],
+        "isModerator": is_moderator_row(user),
     }
 
 
@@ -888,7 +929,7 @@ def _grant_media_access(conn, media_ids: list[str], uploader_id: int, recipient_
 
 
 @app.post("/api/messages", status_code=201)
-def message_send(body: MessageIn, user = Depends(auth_dep)):
+def message_send(body: MessageIn, user = Depends(require_active_user)):
     if body.recipientId == user["id"]:
         raise HTTPException(400, "Cannot message yourself")
     with db() as conn:
@@ -908,7 +949,7 @@ def message_send(body: MessageIn, user = Depends(auth_dep)):
 
 
 @app.post("/api/messages/{msg_id}/read")
-def message_mark_read(msg_id: int, user = Depends(auth_dep)):
+def message_mark_read(msg_id: int, user = Depends(require_active_user)):
     now = int(time.time())
     with db() as conn:
         conn.execute(
@@ -919,7 +960,7 @@ def message_mark_read(msg_id: int, user = Depends(auth_dep)):
 
 
 @app.delete("/api/messages/{msg_id}")
-def message_delete(msg_id: int, user = Depends(auth_dep)):
+def message_delete(msg_id: int, user = Depends(require_active_user)):
     with db() as conn:
         row = conn.execute(
             "SELECT sender_id, recipient_id FROM messages WHERE id = ?", (msg_id,)
@@ -1044,7 +1085,7 @@ def group_preflight(group_id: int, user = Depends(require_user)):
 
 
 @app.post("/api/groups/{group_id}/join", status_code=201)
-def group_join(group_id: int, body: GroupJoinIn, request: Request, user = Depends(auth_dep)):
+def group_join(group_id: int, body: GroupJoinIn, request: Request, user = Depends(require_active_user)):
     rate_limit(f"groupjoin:{client_ip(request)}", 20, 60)
     with db() as conn:
         g = conn.execute("SELECT verifier_hash FROM groups WHERE id = ?", (group_id,)).fetchone()
@@ -1072,7 +1113,7 @@ def group_join(group_id: int, body: GroupJoinIn, request: Request, user = Depend
 
 
 @app.post("/api/groups/{group_id}/leave")
-def group_leave(group_id: int, user = Depends(auth_dep)):
+def group_leave(group_id: int, user = Depends(require_active_user)):
     with db() as conn:
         _require_group_member(conn, group_id, user["id"])
         conn.execute("DELETE FROM group_members WHERE group_id = ? AND user_id = ?", (group_id, user["id"]))
@@ -1113,7 +1154,7 @@ def group_messages_list(group_id: int, limit: int = 200, user = Depends(require_
 
 
 @app.post("/api/groups/{group_id}/messages", status_code=201)
-def group_message_send(group_id: int, body: GroupMessageIn, user = Depends(auth_dep)):
+def group_message_send(group_id: int, body: GroupMessageIn, user = Depends(require_active_user)):
     with db() as conn:
         _require_group_member(conn, group_id, user["id"])
         now = int(time.time())
@@ -1147,7 +1188,7 @@ def group_mark_read(group_id: int, user = Depends(auth_dep)):
 
 
 @app.delete("/api/groups/{group_id}/messages/{msg_id}")
-def group_message_delete(group_id: int, msg_id: int, user = Depends(auth_dep)):
+def group_message_delete(group_id: int, msg_id: int, user = Depends(require_active_user)):
     with db() as conn:
         _require_group_member(conn, group_id, user["id"])
         row = conn.execute(
@@ -1433,7 +1474,97 @@ def report(body: ReportIn, user = Depends(auth_dep)):
     return {"id": cur.lastrowid}
 
 
-# ── Session management ────────────────────────────────────────────────────────
+@app.get("/api/mod/stats")
+def mod_stats(user = Depends(require_moderator)):
+    with db() as conn:
+        total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        total_active = conn.execute("SELECT COUNT(*) FROM users WHERE status = 'active'").fetchone()[0]
+        total_suspended = conn.execute("SELECT COUNT(*) FROM users WHERE status = 'suspended'").fetchone()[0]
+        total_banned = conn.execute("SELECT COUNT(*) FROM users WHERE status = 'banned'").fetchone()[0]
+        total_messages = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        total_reports = conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
+        recent_reports = conn.execute("SELECT COUNT(*) FROM reports WHERE created_at > ?", (int(time.time()) - 86400,)).fetchone()[0]
+    return {
+        "totalUsers": total_users,
+        "activeUsers": total_active,
+        "suspendedUsers": total_suspended,
+        "bannedUsers": total_banned,
+        "totalMessages": total_messages,
+        "totalReports": total_reports,
+        "recentReports": recent_reports,
+        "serverUptime": int(time.time()) - START_TIME,
+        "now": int(time.time()),
+    }
+
+
+@app.get("/api/mod/reports")
+def mod_reports(limit: int = 100, user = Depends(require_moderator)):
+    limit = max(1, min(limit, 200))
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT r.id, r.reason, r.details, r.created_at,
+                        r.message_id, r.group_message_id,
+                        r.reporter_id, rep.email AS reporter_email,
+                        r.reported_user_id, tgt.email AS reported_email
+                   FROM reports r
+                   LEFT JOIN users rep ON rep.id = r.reporter_id
+                   LEFT JOIN users tgt ON tgt.id = r.reported_user_id
+                  ORDER BY r.created_at DESC LIMIT ?""",
+            (limit,)
+        ).fetchall()
+    return [{
+        "id": r["id"],
+        "reason": r["reason"],
+        "details": r["details"],
+        "createdAt": r["created_at"],
+        "messageId": r["message_id"],
+        "groupMessageId": r["group_message_id"],
+        "reporterId": r["reporter_id"],
+        "reporterEmail": r["reporter_email"],
+        "reportedUserId": r["reported_user_id"],
+        "reportedUserEmail": r["reported_email"],
+    } for r in rows]
+
+
+@app.get("/api/mod/users")
+def mod_users(limit: int = 200, user = Depends(require_moderator)):
+    limit = max(1, min(limit, 500))
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, email, role, status, created_at, last_login_at FROM users ORDER BY created_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    return [{
+        "id": r["id"],
+        "email": r["email"],
+        "role": r["role"],
+        "status": r["status"],
+        "createdAt": r["created_at"],
+        "lastLoginAt": r["last_login_at"],
+    } for r in rows]
+
+
+@app.post("/api/mod/users/{user_id}/status")
+def mod_user_status(user_id: int, body: ModUserActionIn, user = Depends(require_moderator)):
+    if user_id == user["id"]:
+        raise HTTPException(400, "Cannot modify your own account")
+    if body.action == "suspend":
+        status = "suspended"
+    elif body.action == "ban":
+        status = "banned"
+    else:
+        status = "active"
+    with db() as conn:
+        target = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not target:
+            raise HTTPException(404, "User not found")
+        conn.execute("UPDATE users SET status = ? WHERE id = ?", (status, user_id))
+        if status == "banned":
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+    return {"ok": True}
+
+
+# ── Session management ────────────────────────────────────────────────────────────
 
 @app.post("/api/auth/logout-all")
 def logout_all(body: DeleteAccountIn, user = Depends(auth_dep)):
