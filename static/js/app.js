@@ -90,6 +90,7 @@ const state = {
   threadKeyCache: {},   // peerId → vault item used last to decrypt (DM only)
   replyingTo: null,     // {id, preview} if replying to a message
   pendingMedia: null,   // {id, keyHex, name, type, size} attached to next message
+  messagesDecrypted: false, // whether messages in current thread are decrypted
   route: "cipher",
   cipherMode: "encrypt",
   showKey: false,
@@ -100,10 +101,16 @@ function setView(name) {
     $(`view-${v}`).classList.toggle("hidden", v !== name);
   }
 }
+function updateModeratorTab() {
+  const tab = document.querySelector('#main-tabs .tab[data-route="moderation"]');
+  if (!tab) return;
+  tab.classList.toggle("hidden", !state.user?.isModerator);
+}
 function setRoute(r) {
+  if (r === "moderation" && !state.user?.isModerator) r = "cipher";
   state.route = r;
   for (const t of $$("#main-tabs .tab")) t.classList.toggle("active", t.dataset.route === r);
-  for (const p of ["cipher", "vault", "messages", "history", "settings"]) {
+  for (const p of ["cipher", "vault", "messages", "history", "settings", "moderation"]) {
     $(`tab-${p}`).classList.toggle("hidden", p !== r);
     $(`tab-${p}`).classList.toggle("active", p === r);
   }
@@ -111,6 +118,7 @@ function setRoute(r) {
   if (r === "history")  loadHistory();
   if (r === "settings") loadSettings();
   if (r === "messages") loadThreads();
+  if (r === "moderation") loadModeration();
   location.hash = r;
 }
 
@@ -239,6 +247,7 @@ $("unlock-form").addEventListener("submit", async (e) => {
 async function loadUser() {
   state.user = await api.get("/api/auth/me");
   $("user-email").textContent = state.user.email;
+  updateModeratorTab();
 }
 
 async function logout() {
@@ -726,6 +735,62 @@ async function loadSettings() {
   await loadLoginHistory();
 }
 
+async function loadModeration() {
+  const stats = await api.get("/api/mod/stats");
+  $("mod-total-users").textContent = stats.totalUsers;
+  $("mod-active-users").textContent = stats.activeUsers;
+  $("mod-suspended-users").textContent = stats.suspendedUsers;
+  $("mod-banned-users").textContent = stats.bannedUsers;
+  $("mod-total-messages").textContent = stats.totalMessages;
+  $("mod-total-reports").textContent = stats.totalReports;
+
+  const reports = await api.get("/api/mod/reports?limit=100");
+  const reportsList = $("mod-reports-list");
+  if (reports.length === 0) {
+    reportsList.innerHTML = `<div class="empty"><p>No recent reports.</p></div>`;
+  } else {
+    reportsList.innerHTML = reports.map(r => `
+      <div class="report-row" style="padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.08);">
+        <div><b>${escapeHtml(r.reason)}</b> · ${fmtTime(r.createdAt)}</div>
+        <div class="muted small">Reporter: ${escapeHtml(r.reporterEmail || "unknown")} · Reported: ${escapeHtml(r.reportedUserEmail || "unknown")}</div>
+        <div>${escapeHtml(r.details || "No additional details.")}</div>
+        <div class="muted small">DM ${r.messageId ? `id ${r.messageId}` : r.groupMessageId ? `group id ${r.groupMessageId}` : "user report"}</div>
+      </div>
+    `).join("");
+  }
+
+  const users = await api.get("/api/mod/users?limit=200");
+  const usersList = $("mod-users-list");
+  if (users.length === 0) {
+    usersList.innerHTML = `<div class="empty"><p>No user accounts.</p></div>`;
+  } else {
+    usersList.innerHTML = users.map(u => `
+      <div class="session-item" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+        <div style="min-width:0;">
+          <div><b>${escapeHtml(u.email)}</b> ${u.role === "moderator" ? `<span class="hint">(moderator)</span>` : ""}</div>
+          <div class="muted small">Status: ${escapeHtml(u.status)} · Created ${fmtTime(u.createdAt)} · Last login ${fmtTime(u.lastLoginAt)}</div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          ${u.status !== "suspended" && u.status !== "banned" ? `<button class="btn ghost" data-mod-action="suspend" data-user-id="${u.id}">Suspend</button><button class="btn ghost" data-mod-action="ban" data-user-id="${u.id}">Ban</button>` : ""}
+          ${u.status !== "active" ? `<button class="btn primary" data-mod-action="restore" data-user-id="${u.id}">Restore</button>` : ""}
+        </div>
+      </div>
+    `).join("");
+    for (const btn of usersList.querySelectorAll("[data-mod-action]")) {
+      btn.addEventListener("click", async () => {
+        const action = btn.dataset.modAction;
+        const userId = Number(btn.dataset.userId);
+        const confirmText = action === "ban" ? "Ban this account?" : action === "suspend" ? "Suspend this account?" : "Restore this account?";
+        const ok = await confirmDialog({ title: confirmText, body: "This change affects sign-in and messaging rights.", okText: action === "restore" ? "Restore" : action === "ban" ? "Ban" : "Suspend", danger: action !== "restore" });
+        if (!ok) return;
+        await api.post(`/api/mod/users/${userId}/status`, { action });
+        toast(`Account ${action}ed`, "info");
+        loadModeration();
+      });
+    }
+  }
+}
+
 async function loadSessions() {
   const list = $("sessions-list");
   list.innerHTML = '<p class="muted small">Loading…</p>';
@@ -875,7 +940,7 @@ $("delete-account-form").addEventListener("submit", async (e) => {
 for (const t of $$("#main-tabs .tab")) t.addEventListener("click", () => setRoute(t.dataset.route));
 window.addEventListener("hashchange", () => {
   const r = location.hash.slice(1);
-  if (["cipher","vault","messages","history","settings"].includes(r)) setRoute(r);
+  if (["cipher","vault","messages","history","settings","moderation"].includes(r)) setRoute(r);
 });
 
 // ─── Keyboard shortcuts ────────────────────────────────────────
@@ -1042,10 +1107,20 @@ async function openDmThread(peerId) {
       <div class="h-meta">direct · end-to-end · key never leaves your browser</div>
     </div>
     <div style="display:flex;gap:6px;">
+      <button class="icon-btn" id="msg-decrypt-all" type="button">decrypt all</button>
+      <button class="icon-btn" id="msg-encrypt-all" type="button">encrypt all</button>
       <button class="icon-btn" id="msg-refresh" type="button">refresh</button>
       <button class="icon-btn" id="msg-block" type="button">block</button>
     </div>
   `;
+  $("msg-decrypt-all").addEventListener("click", () => {
+    state.messagesDecrypted = true;
+    renderDmMessages();
+  });
+  $("msg-encrypt-all").addEventListener("click", () => {
+    state.messagesDecrypted = false;
+    renderDmMessages();
+  });
   $("msg-refresh").addEventListener("click", () => loadDmMessages(peerId));
   $("msg-block").addEventListener("click", async () => {
     const ok = await confirmDialog({
@@ -1084,11 +1159,21 @@ async function openGroupThread(groupId) {
       <div class="h-meta">group · encrypted with shared join code</div>
     </div>
     <div style="display:flex;gap:6px;">
+      <button class="icon-btn" id="msg-decrypt-all" type="button">decrypt all</button>
+      <button class="icon-btn" id="msg-encrypt-all" type="button">encrypt all</button>
       <button class="icon-btn" id="msg-refresh" type="button">refresh</button>
       <button class="icon-btn" id="msg-share-code" type="button">share code</button>
       <button class="icon-btn" id="msg-leave-group" type="button">leave</button>
     </div>
   `;
+  $("msg-decrypt-all").addEventListener("click", () => {
+    state.messagesDecrypted = true;
+    renderGroupMessages();
+  });
+  $("msg-encrypt-all").addEventListener("click", () => {
+    state.messagesDecrypted = false;
+    renderGroupMessages();
+  });
   $("msg-refresh").addEventListener("click", () => loadGroupMessages(groupId));
   $("msg-share-code").addEventListener("click", async () => {
     if (!g.passcode) {
@@ -1128,6 +1213,8 @@ async function openGroupThread(groupId) {
 async function loadDmMessages(peerId) {
   try {
     state.messages = await api.get(`/api/messages?peer=${peerId}&limit=200`);
+    // Reset decryption state for new thread
+    state.messagesDecrypted = false;
     await renderDmMessages();
     for (const m of state.messages) {
       if (!m.fromMe && !m.readAt) {
@@ -1145,6 +1232,8 @@ async function loadDmMessages(peerId) {
 async function loadGroupMessages(groupId) {
   try {
     state.messages = await api.get(`/api/groups/${groupId}/messages?limit=200`);
+    // Reset decryption state for new thread
+    state.messagesDecrypted = false;
     await renderGroupMessages();
     try { await api.post(`/api/groups/${groupId}/read`); } catch {}
     const g = state.groups.find(x => x.id === groupId);
@@ -1227,14 +1316,15 @@ async function loadMediaInto(el) {
 }
 
 function renderBubble(m, decrypted, side, opts = {}) {
-  const meta = decrypted.ok
+  const isDecrypted = state.messagesDecrypted;
+  const meta = isDecrypted && decrypted.ok
     ? `<span>${escapeHtml(opts.label || decrypted.keyLabel || "key")}</span><span>·</span><span>${fmtTime(m.createdAt)}</span>`
-    : `<span>can't decrypt</span><span>·</span><span>${fmtTime(m.createdAt)}</span>`;
+    : `<span>encrypted</span><span>·</span><span>${fmtTime(m.createdAt)}</span>`;
   const sender = opts.sender ? `<div class="b-hint">${escapeHtml(opts.sender)}</div>` : "";
   const hint = m.hint ? `<div class="b-hint">hint: ${escapeHtml(m.hint)}</div>` : "";
 
   let bodyHtml = "";
-  if (decrypted.ok) {
+  if (isDecrypted && decrypted.ok) {
     const parsed = parseMessagePayload(decrypted.text);
     if (parsed.text) bodyHtml += `<div>${escapeHtml(parsed.text)}</div>`;
     for (const med of parsed.media) {
@@ -1245,7 +1335,7 @@ function renderBubble(m, decrypted, side, opts = {}) {
   }
   const replyIndicator = m.replyToId ? `<div class="b-reply-indicator">↳ reply to message</div>` : "";
   return `
-    <div class="msg-bubble ${side} ${decrypted.ok ? "" : "encrypted"}" data-id="${m.id}" data-reply-to="${m.replyToId || ""}" data-sender="${opts.senderId || ""}">
+    <div class="msg-bubble ${side} ${isDecrypted && decrypted.ok ? "" : "encrypted"}" data-id="${m.id}" data-reply-to="${m.replyToId || ""}" data-sender="${opts.senderId || ""}">
       ${sender}${replyIndicator}${hint}${bodyHtml}
       <div class="b-meta">${meta}</div>
       <div class="b-actions">
