@@ -101,10 +101,16 @@ function setView(name) {
     $(`view-${v}`).classList.toggle("hidden", v !== name);
   }
 }
+function updateModeratorTab() {
+  const tab = document.querySelector('#main-tabs .tab[data-route="moderation"]');
+  if (!tab) return;
+  tab.classList.toggle("hidden", !state.user?.isModerator);
+}
 function setRoute(r) {
+  if (r === "moderation" && !state.user?.isModerator) r = "cipher";
   state.route = r;
   for (const t of $$("#main-tabs .tab")) t.classList.toggle("active", t.dataset.route === r);
-  for (const p of ["cipher", "vault", "messages", "history", "settings"]) {
+  for (const p of ["cipher", "vault", "messages", "history", "settings", "moderation"]) {
     $(`tab-${p}`).classList.toggle("hidden", p !== r);
     $(`tab-${p}`).classList.toggle("active", p === r);
   }
@@ -112,6 +118,7 @@ function setRoute(r) {
   if (r === "history")  loadHistory();
   if (r === "settings") loadSettings();
   if (r === "messages") loadThreads();
+  if (r === "moderation") loadModeration();
   location.hash = r;
 }
 
@@ -240,6 +247,7 @@ $("unlock-form").addEventListener("submit", async (e) => {
 async function loadUser() {
   state.user = await api.get("/api/auth/me");
   $("user-email").textContent = state.user.email;
+  updateModeratorTab();
 }
 
 async function logout() {
@@ -727,6 +735,160 @@ async function loadSettings() {
   await loadLoginHistory();
 }
 
+async function loadModeration() {
+  try {
+    const stats = await api.get("/api/mod/stats");
+    $("mod-total-users").textContent = stats.totalUsers;
+    $("mod-active-users").textContent = stats.activeUsers;
+    $("mod-suspended-users").textContent = stats.suspendedUsers;
+    $("mod-banned-users").textContent = stats.bannedUsers;
+    $("mod-total-messages").textContent = stats.totalMessages;
+    $("mod-total-reports").textContent = stats.totalReports;
+
+    const reports = await api.get("/api/mod/reports?limit=100");
+  const reportsList = $("mod-reports-list");
+  reportsList.replaceChildren();
+  if (reports.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    const p = document.createElement("p");
+    p.textContent = "No recent reports.";
+    empty.appendChild(p);
+    reportsList.appendChild(empty);
+  } else {
+    reports.forEach(r => {
+      const reportRow = document.createElement("div");
+      reportRow.className = "report-row";
+      reportRow.style.cssText = "padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.08);";
+      
+      const line1 = document.createElement("div");
+      const reasonB = document.createElement("b");
+      reasonB.textContent = r.reason;
+      line1.appendChild(reasonB);
+      line1.appendChild(document.createTextNode(" · " + fmtTime(r.createdAt)));
+      reportRow.appendChild(line1);
+      
+      const line2 = document.createElement("div");
+      line2.className = "muted small";
+      line2.textContent = "Reporter: " + (r.reporterEmail || "unknown") + " · Reported: " + (r.reportedUserEmail || "unknown");
+      reportRow.appendChild(line2);
+      
+      const line3 = document.createElement("div");
+      line3.textContent = r.details || "No additional details.";
+      reportRow.appendChild(line3);
+      
+      const line4 = document.createElement("div");
+      line4.className = "muted small";
+      line4.textContent = "DM " + (r.messageId ? "id " + r.messageId : r.groupMessageId ? "group id " + r.groupMessageId : "user report");
+      reportRow.appendChild(line4);
+      
+      reportsList.appendChild(reportRow);
+    });
+  }
+
+  const users = await api.get("/api/mod/users?limit=200");
+  const usersList = $("mod-users-list");
+  usersList.replaceChildren();
+  if (users.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    const p = document.createElement("p");
+    p.textContent = "No user accounts.";
+    empty.appendChild(p);
+    usersList.appendChild(empty);
+  } else {
+    users.forEach(u => {
+      const sessionItem = document.createElement("div");
+      sessionItem.className = "session-item";
+      sessionItem.style.cssText = "display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;";
+      
+      const leftDiv = document.createElement("div");
+      leftDiv.style.cssText = "min-width:0;";
+      
+      const emailDiv = document.createElement("div");
+      const emailB = document.createElement("b");
+      emailB.textContent = u.email;
+      emailDiv.appendChild(emailB);
+      if (u.role === "moderator") {
+        const hint = document.createElement("span");
+        hint.className = "hint";
+        hint.textContent = "(moderator)";
+        emailDiv.appendChild(document.createTextNode(" "));
+        emailDiv.appendChild(hint);
+      }
+      leftDiv.appendChild(emailDiv);
+      
+      const statusDiv = document.createElement("div");
+      statusDiv.className = "muted small";
+      statusDiv.textContent = "Status: " + u.status + " · Created " + fmtTime(u.createdAt) + " · Last login " + fmtTime(u.lastLoginAt);
+      leftDiv.appendChild(statusDiv);
+      
+      sessionItem.appendChild(leftDiv);
+      
+      const rightDiv = document.createElement("div");
+      rightDiv.style.cssText = "display:flex;gap:8px;flex-wrap:wrap;";
+      
+      if (u.status !== "suspended" && u.status !== "banned") {
+        const suspendBtn = document.createElement("button");
+        suspendBtn.className = "btn ghost";
+        suspendBtn.setAttribute("data-mod-action", "suspend");
+        suspendBtn.setAttribute("data-user-id", u.id);
+        suspendBtn.textContent = "Suspend";
+        rightDiv.appendChild(suspendBtn);
+        
+        const banBtn = document.createElement("button");
+        banBtn.className = "btn ghost";
+        banBtn.setAttribute("data-mod-action", "ban");
+        banBtn.setAttribute("data-user-id", u.id);
+        banBtn.textContent = "Ban";
+        rightDiv.appendChild(banBtn);
+      }
+      
+      if (u.status !== "active") {
+        const restoreBtn = document.createElement("button");
+        restoreBtn.className = "btn primary";
+        restoreBtn.setAttribute("data-mod-action", "restore");
+        restoreBtn.setAttribute("data-user-id", u.id);
+        restoreBtn.textContent = "Restore";
+        rightDiv.appendChild(restoreBtn);
+      }
+      
+      sessionItem.appendChild(rightDiv);
+      usersList.appendChild(sessionItem);
+    });
+    for (const btn of usersList.querySelectorAll("[data-mod-action]")) {
+      btn.addEventListener("click", async () => {
+        try {
+          const action = btn.dataset.modAction;
+          const userId = Number(btn.dataset.userId);
+          const confirmText = action === "ban" ? "Ban this account?" : action === "suspend" ? "Suspend this account?" : "Restore this account?";
+          const ok = await confirmDialog({ title: confirmText, body: "This change affects sign-in and messaging rights.", okText: action === "restore" ? "Restore" : action === "ban" ? "Ban" : "Suspend", danger: action !== "restore" });
+          if (!ok) return;
+          await api.post(`/api/mod/users/${userId}/status`, { action });
+          const actionLabel = { suspend: "suspended", ban: "banned", restore: "restored" }[action];
+          toast(`Account ${actionLabel}`, "info");
+          loadModeration();
+        } catch (e) {
+          toast(`Error: ${e.message}`, "error");
+        }
+      });
+    }
+  }
+} catch (e) {
+  const reportsList = $("mod-reports-list");
+  const usersList = $("mod-users-list");
+  
+  const errorEl1 = document.createElement("p");
+  errorEl1.className = "form-error";
+  errorEl1.textContent = e.message;
+  reportsList.replaceChildren(errorEl1);
+  
+  const errorEl2 = document.createElement("p");
+  errorEl2.className = "form-error";
+  errorEl2.textContent = e.message;
+  usersList.replaceChildren(errorEl2);
+}
+
 async function loadSessions() {
   const list = $("sessions-list");
   list.innerHTML = '<p class="muted small">Loading…</p>';
@@ -876,7 +1038,7 @@ $("delete-account-form").addEventListener("submit", async (e) => {
 for (const t of $$("#main-tabs .tab")) t.addEventListener("click", () => setRoute(t.dataset.route));
 window.addEventListener("hashchange", () => {
   const r = location.hash.slice(1);
-  if (["cipher","vault","messages","history","settings"].includes(r)) setRoute(r);
+  if (["cipher","vault","messages","history","settings","moderation"].includes(r)) setRoute(r);
 });
 
 // ─── Keyboard shortcuts ────────────────────────────────────────
@@ -1080,7 +1242,7 @@ async function openDmThread(peerId) {
   refreshMsgKeySource();
   renderThreads();
   renderGroups();
-  await loadDmMessages(peerId);
+  await loadDmMessages(peerId, true);
   setTimeout(() => msgEls.body.focus(), 50);
 }
 
@@ -1142,15 +1304,14 @@ async function openGroupThread(groupId) {
   msgEls.keyRow.classList.add("hidden"); // group key is fixed
   renderThreads();
   renderGroups();
-  await loadGroupMessages(groupId);
+  await loadGroupMessages(groupId, true);
   setTimeout(() => msgEls.body.focus(), 50);
 }
 
-async function loadDmMessages(peerId) {
+async function loadDmMessages(peerId, resetDecryption = false) {
   try {
     state.messages = await api.get(`/api/messages?peer=${peerId}&limit=200`);
-    // Reset decryption state for new thread
-    state.messagesDecrypted = false;
+    if (resetDecryption) state.messagesDecrypted = false;
     await renderDmMessages();
     for (const m of state.messages) {
       if (!m.fromMe && !m.readAt) {
@@ -1165,11 +1326,10 @@ async function loadDmMessages(peerId) {
   }
 }
 
-async function loadGroupMessages(groupId) {
+async function loadGroupMessages(groupId, resetDecryption = false) {
   try {
     state.messages = await api.get(`/api/groups/${groupId}/messages?limit=200`);
-    // Reset decryption state for new thread
-    state.messagesDecrypted = false;
+    if (resetDecryption) state.messagesDecrypted = false;
     await renderGroupMessages();
     try { await api.post(`/api/groups/${groupId}/read`); } catch {}
     const g = state.groups.find(x => x.id === groupId);
@@ -1817,6 +1977,7 @@ async function boot() {
     state.user = await api.get("/api/auth/me");
     $("user-email").textContent = state.user.email;
     $("unlock-email").textContent = state.user.email;
+    updateModeratorTab();
     setView("unlock");
     setTimeout(() => $("unlock-password").focus(), 60);
   } catch (err) {
